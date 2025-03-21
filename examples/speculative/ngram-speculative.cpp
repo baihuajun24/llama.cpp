@@ -372,6 +372,7 @@ int main(int argc, char ** argv) {
     drafts[0].i_batch_tgt[0] = 0;
 
     std::vector<double> all_draft_times;
+    std::vector<double> all_target_decode_times;
 
     while (true) {
         std::set<int> active_seqs = {};
@@ -401,156 +402,28 @@ int main(int argc, char ** argv) {
             // for stochastic sampling, attempt to match the token with the drafted tokens
             {
                 bool accept = false;
-                if (params.sampling.temp > 0) {
-                    // stochastic verification
-                    common_sampler_sample(smpl, ctx_tgt, drafts[s_keep].i_batch_tgt[i_dft], true);
 
-                    auto & dist_tgt = *common_sampler_get_candidates(smpl);
+                // only-greedy, simplifies the code
+                // sample from the target model
+                LOG_DBG("sampling target: s_keep = %3d, i_dft = %3d, i_batch_tgt = %3d\n", s_keep, i_dft, drafts[s_keep].i_batch_tgt[i_dft]);
+                token_id = common_sampler_sample(smpl, ctx_tgt, drafts[s_keep].i_batch_tgt[i_dft]);
 
-                    float p_tgt = 0.0f;
-                    float p_dft = 0.0f;
+                common_sampler_accept(smpl, token_id, true);
 
-                    while (active_seqs.size() > 0) {
-                        // randomly select a sequence to verify from active sequences
-                        std::uniform_int_distribution<unsigned int> u_int_dist(0, active_seqs.size() - 1);
-                        int s = *std::next(active_seqs.begin(), u_int_dist(rng));
-                        if (i_dft >= (int) drafts[s].tokens.size()) {
-                            drafts[s].active = false;
-                            active_seqs.erase(s);
-                            continue;
-                        }
-                        if (accept) {
-                            // if we already accepted a token, we can skip the rest
-                            if (drafts[s].tokens[i_dft] != drafts[s_keep].tokens[i_dft]) {
-                                drafts[s].active = false;
-                                active_seqs.erase(s);
-                            }
-                            continue;
-                        }
+                token_str = common_token_to_piece(ctx_tgt, token_id);
 
-                        LOG_DBG("verifying sequence #%d at pos #%d from %d active sequence(s)\n", s, i_dft, (int) active_seqs.size());
-                        float r = u_dist(rng);
-                        llama_token_data_array dist_dft = { drafts[s].dists[i_dft].data() , drafts[s].dists[i_dft].size(), LLAMA_TOKEN_NULL, true };
-
-                        //GGML_ASSERT(dist_tgt.size <= dist_dft.size);
-
-                        // acquire the token probabilities assigned by the draft and target models
-                        for (size_t i = 0; i < dist_tgt.size; i++) {
-                            if (dist_tgt.data[i].id == drafts[s].tokens[i_dft]) {
-                                p_tgt = dist_tgt.data[i].p;
-                                break;
-                            }
-                        }
-                        for (size_t i = 0; i < dist_dft.size; i++) {
-                            if (dist_dft.data[i].id == drafts[s].tokens[i_dft]) {
-                                p_dft = dist_dft.data[i].p;
-                                break;
-                            }
-                        }
-                        LOG_DBG("r = %f, p_dft = %f, p_tgt = %f\n", r, p_dft, p_tgt);
-                        if (r <= p_tgt / p_dft) {
-                            s_keep = s;
-                            accept = true;
-                            token_id = drafts[s].tokens[i_dft];
-                            token_str = common_token_to_piece(ctx_tgt, token_id);
-                            common_sampler_accept(smpl, token_id, true);
-
-                            LOG_DBG("draft token %d of sequence %d (%d, '%s') accepted\n", i_dft, s, token_id, token_str.c_str());
-                            break;
-                        } else {
-                            LOG_DBG("draft token %d of sequence %d (%d, '%s') rejected\n", i_dft, s, drafts[s].tokens[i_dft], common_token_to_piece(ctx_tgt, drafts[s].tokens[i_dft]).c_str());
-                            drafts[s].active = false;
-
-                            // calculate residual probability
-                            GGML_ASSERT(dist_tgt.sorted);
-                            GGML_ASSERT(dist_dft.sorted);
-
-                            // sort dist by id
-                            std::sort(dist_tgt.data, dist_tgt.data + dist_tgt.size, [](const llama_token_data &a, const llama_token_data &b) {
-                                return a.id < b.id;
-                            });
-                            std::sort(dist_dft.data, dist_dft.data + dist_dft.size, [](const llama_token_data &a, const llama_token_data &b) {
-                                return a.id < b.id;
-                            });
-
-                            float sum_probs = 0.0f;
-
-                            for (size_t i = 0; i < dist_tgt.size; i++) {
-                                if (i < dist_dft.size) {
-                                    dist_tgt.data[i].p = std::max(0.0f, dist_tgt.data[i].p - dist_dft.data[i].p);
-                                } else {
-                                    dist_tgt.data[i].p = std::max(0.0f, dist_tgt.data[i].p);
-                                }
-
-                                sum_probs += dist_tgt.data[i].p;
-                            }
-
-                            for (size_t i = 0; i < dist_tgt.size; i++) {
-                                dist_tgt.data[i].p /= sum_probs;
-                            }
-
-                            // sort dist_tgt by p desc
-                            std::sort(dist_tgt.data, dist_tgt.data + dist_tgt.size, [](const llama_token_data &a, const llama_token_data &b) {
-                                return a.p > b.p;
-                            });
-                        }
-
-                        active_seqs.erase(s);
-                        for(int i = 0; i < n_seq_dft; i++) {
-                            if (i == s) {
-                                continue;
-                            }
-                            if (drafts[i].tokens[i_dft] == drafts[s].tokens[i_dft]) {
-                                // synchronize active status for sequences with the same drafted token
-                                drafts[i].active = drafts[i].active && accept;
-                                if (!drafts[i].active) {
-                                    active_seqs.erase(s);
-                                }
-                            }
-                        }
+                for (int s = 0; s < n_seq_dft; ++s) {
+                    if (!drafts[s].active) {
+                        continue;
                     }
 
-                    if (!accept) {
-                        // all drafted tokens were rejected
-                        // sample from the target model
-                        LOG_DBG("all drafted tokens were rejected, sampling from residual distribution\n");
-                        std::vector<float> probs(dist_tgt.size);
-                        for (size_t i = 0; i < dist_tgt.size; ++i) {
-                            probs[i] = dist_tgt.data[i].p;
-                        }
+                    if (i_dft < (int) drafts[s].tokens.size() && token_id == drafts[s].tokens[i_dft]) {
+                        LOG_DBG("the sampled target token matches the %dth drafted token of sequence %d (%d, '%s') - accepted\n", i_dft, s, token_id, token_str.c_str());
 
-                        std::discrete_distribution<> dist(probs.begin(), probs.end());
-
-                        const int idx = dist(rng);
-
-                        token_id = dist_tgt.data[idx].id;
-                        common_sampler_accept(smpl, token_id, true);
-                        token_str = common_token_to_piece(ctx_tgt, token_id);
-                    }
-                } else {
-                    // greedy verification
-
-                    // sample from the target model
-                    LOG_DBG("sampling target: s_keep = %3d, i_dft = %3d, i_batch_tgt = %3d\n", s_keep, i_dft, drafts[s_keep].i_batch_tgt[i_dft]);
-                    token_id = common_sampler_sample(smpl, ctx_tgt, drafts[s_keep].i_batch_tgt[i_dft]);
-
-                    common_sampler_accept(smpl, token_id, true);
-
-                    token_str = common_token_to_piece(ctx_tgt, token_id);
-
-                    for (int s = 0; s < n_seq_dft; ++s) {
-                        if (!drafts[s].active) {
-                            continue;
-                        }
-
-                        if (i_dft < (int) drafts[s].tokens.size() && token_id == drafts[s].tokens[i_dft]) {
-                            LOG_DBG("the sampled target token matches the %dth drafted token of sequence %d (%d, '%s') - accepted\n", i_dft, s, token_id, token_str.c_str());
-
-                            s_keep = s;
-                            accept = true;
-                        } else {
-                            drafts[s].active = false;
-                        }
+                        s_keep = s;
+                        accept = true;
+                    } else {
+                        drafts[s].active = false;
                     }
                 }
 
@@ -578,43 +451,39 @@ int main(int argc, char ** argv) {
             }
         }
 
-        {
-            LOG_DBG("the sampled target token (%d, '%s') did not match, or we ran out of drafted tokens\n", token_id, token_str.c_str());
+        LOG_DBG("the sampled target token (%d, '%s') did not match, or we ran out of drafted tokens\n", token_id, token_str.c_str());
 
-            // TODO: simplify
-            {
-                LOG_DBG("keeping sequence %d, n_past_tgt = %d, n_past_dft = %d\n", s_keep, n_past_tgt, n_past_dft);
+        // TODO: simplify
+        LOG_DBG("keeping sequence %d, n_past_tgt = %d, n_past_dft = %d\n", s_keep, n_past_tgt, n_past_dft);
 
-                llama_kv_self_seq_keep(ctx_dft, s_keep);
-                llama_kv_self_seq_cp  (ctx_dft, s_keep, 0, -1, -1);
-                llama_kv_self_seq_keep(ctx_dft, 0);
+        llama_kv_self_seq_keep(ctx_dft, s_keep);
+        llama_kv_self_seq_cp  (ctx_dft, s_keep, 0, -1, -1);
+        llama_kv_self_seq_keep(ctx_dft, 0);
 
-                llama_kv_self_seq_rm  (ctx_tgt, s_keep, n_past_tgt, -1);
-                llama_kv_self_seq_keep(ctx_tgt, s_keep);
-                llama_kv_self_seq_cp  (ctx_tgt, s_keep, 0, -1, -1);
-                llama_kv_self_seq_keep(ctx_tgt, 0);
-            }
+        llama_kv_self_seq_rm  (ctx_tgt, s_keep, n_past_tgt, -1);
+        llama_kv_self_seq_keep(ctx_tgt, s_keep);
+        llama_kv_self_seq_cp  (ctx_tgt, s_keep, 0, -1, -1);
+        llama_kv_self_seq_keep(ctx_tgt, 0);
 
-            for (int s = 0; s < n_seq_dft; ++s) {
-                drafts[s].active = false;
-                drafts[s].tokens.clear();
-                drafts[s].i_batch_tgt.clear();
-                drafts[s].dists.clear();
-            }
-            // note: will be erased after the speculation phase
-            drafts[0].tokens.push_back(token_id);
-            drafts[0].dists.push_back(std::vector<llama_token_data>());
-            drafts[0].i_batch_tgt.push_back(0);
-
-            common_batch_clear(batch_dft);
-            common_batch_add  (batch_dft, token_id, n_past_dft, { 0 }, true);
-
-            llama_kv_self_seq_rm(ctx_dft, 0, n_past_dft, -1);
-            // LOG_DBG("dft batch: %s\n", LOG_BATCH_TOSTR_PRETTY(ctx_dft, batch_dft).c_str());
-            llama_decode(ctx_dft, batch_dft);
-
-            ++n_past_dft;
+        for (int s = 0; s < n_seq_dft; ++s) {
+            drafts[s].active = false;
+            drafts[s].tokens.clear();
+            drafts[s].i_batch_tgt.clear();
+            drafts[s].dists.clear();
         }
+        // note: will be erased after the speculation phase
+        drafts[0].tokens.push_back(token_id);
+        drafts[0].dists.push_back(std::vector<llama_token_data>());
+        drafts[0].i_batch_tgt.push_back(0);
+
+        common_batch_clear(batch_dft);
+        common_batch_add  (batch_dft, token_id, n_past_dft, { 0 }, true);
+
+        llama_kv_self_seq_rm(ctx_dft, 0, n_past_dft, -1);
+        // LOG_DBG("dft batch: %s\n", LOG_BATCH_TOSTR_PRETTY(ctx_dft, batch_dft).c_str());
+        llama_decode(ctx_dft, batch_dft);
+
+        ++n_past_dft;
 
         if ((params.n_predict >= 0 && n_predict > params.n_predict) || has_eos) {
             break;
@@ -648,7 +517,7 @@ int main(int argc, char ** argv) {
         double average_time_per_draft = (t_draft_gen_end - t_draft_gen_start) / 1e3 / n_draft;
 
         // Log the time taken to generate draft sequences in the new format
-        LOG_INF("[DF: %.3f ms]\n", average_time_per_draft);
+        LOG_INF("[sampling: %.3f ms]\n", average_time_per_draft);
 
         all_draft_times.push_back(average_time_per_draft);
 
@@ -660,7 +529,12 @@ int main(int argc, char ** argv) {
             }
 
             // LOG_DBG("target batch: %s\n", LOG_BATCH_TOSTR_PRETTY(ctx_tgt, batch_tgt).c_str());
+            const auto ctx_tgt_start_time = ggml_time_us(); // Start timing
             llama_decode(ctx_tgt, batch_tgt);
+            const auto ctx_tgt_end_time = ggml_time_us(); // End timing
+            double average_time_per_target_decode = (ctx_tgt_end_time - ctx_tgt_start_time) / 1e3 / n_seq_dft;
+            LOG_INF("[TF: %.3f ms]\n", average_time_per_target_decode);
+            all_target_decode_times.push_back(average_time_per_target_decode);
             ++n_past_tgt;
         }
 
@@ -678,7 +552,8 @@ int main(int argc, char ** argv) {
     auto t_dec_end = ggml_time_us();
 
     LOG("\n\n");
-    LOG_INF("Average draft model forward time: %.3f ms\n", std::accumulate(all_draft_times.begin(), all_draft_times.end(), 0.0) / all_draft_times.size());
+    LOG_INF("Average draft model forward + sampling time: %.3f ms\n", std::accumulate(all_draft_times.begin(), all_draft_times.end(), 0.0) / all_draft_times.size());
+    LOG_INF("Average target model forward time: %.3f ms\n", std::accumulate(all_target_decode_times.begin(), all_target_decode_times.end(), 0.0) / all_target_decode_times.size());
     LOG_INF("encoded %4d tokens in %8.3f seconds, speed: %8.3f t/s\n", n_input,   (t_enc_end - t_enc_start) / 1e6f, inp.size() / ((t_enc_end - t_enc_start) / 1e6f));
     LOG_INF("decoded %4d tokens in %8.3f seconds, speed: %8.3f t/s\n", n_predict, (t_dec_end - t_dec_start) / 1e6f, n_predict  / ((t_dec_end - t_dec_start) / 1e6f));
 
