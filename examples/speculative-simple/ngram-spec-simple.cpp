@@ -11,6 +11,15 @@
 #include <vector>
 #include <numeric> // For std::accumulate
 
+llama_tokens generate_dummy_draft_tokens(llama_context* ctx_tgt) {
+    // Dummy string to tokenize
+    std::string dummy_string = "Hillary Clinton";
+    
+    // Tokenize the dummy string
+    llama_tokens draft = common_tokenize(ctx_tgt, dummy_string, true, true);
+    return draft;
+}
+
 int main(int argc, char ** argv) {
     common_params params;
 
@@ -152,7 +161,9 @@ int main(int argc, char ** argv) {
         // from a cache or lookup tables.
         //
         auto t_draft_start = ggml_time_us(); 
-        llama_tokens draft = common_speculative_gen_draft(spec, params_spec, prompt_tgt, id_last);
+        // llama_tokens draft = common_speculative_gen_draft(spec, params_spec, prompt_tgt, id_last);
+        llama_tokens draft = generate_dummy_draft_tokens(ctx_tgt);
+
         auto t_draft_end = ggml_time_us(); 
         draft_times.push_back((t_draft_end - t_draft_start) / 1e3);
         //LOG_DBG("draft: %s\n", string_from(ctx_dft, draft).c_str());
@@ -161,6 +172,12 @@ int main(int argc, char ** argv) {
         common_batch_clear(batch_tgt);
         common_batch_add  (batch_tgt, id_last, n_past++, { 0 }, true);
 
+        // LOG_INF to print [id_last, draft0, draft1, ..., draftN-1] to understand what draft sequence is
+        // one each line print id, decode token from id
+        LOG_INF("[check id_last]: %s, draft length: %zu\n", common_token_to_piece(ctx_tgt, id_last).c_str(), draft.size());
+        for (size_t i = 0; i < draft.size(); i++) {
+            LOG_INF("[check draft %zu]: %d: %s\n", i, draft[i], common_token_to_piece(ctx_dft, draft[i]).c_str());
+        }
         // evaluate the target model on [id_last, draft0, draft1, ..., draftN-1]
         {
             // do not waste time on small drafts
@@ -215,12 +232,12 @@ int main(int argc, char ** argv) {
             }
 
             const std::string token_str = common_token_to_piece(ctx_tgt, id_last);
-
-            if (params.use_color && i + 1 < ids.size()) {
-                LOG("\u001b[%dm%s\u001b[37m", (36 - 0 % 6), token_str.c_str());
-            } else {
-                LOG("%s", token_str.c_str());
-            }
+            // 0322: temporary disable to debug
+            // if (params.use_color && i + 1 < ids.size()) {
+            //     LOG("\u001b[%dm%s\u001b[37m", (36 - 0 % 6), token_str.c_str());
+            // } else {
+            //     LOG("%s", token_str.c_str());
+            // }
         }
 
         LOG_DBG("accepted %d/%d draft tokens, the last target token is: (%d)\n", (int) ids.size() - 1, (int) draft.size(), id_last);
