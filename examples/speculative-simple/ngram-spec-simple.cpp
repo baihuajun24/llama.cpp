@@ -16,34 +16,102 @@
 #include <numeric> // For std::accumulate
 
 static const int N_RETRIEVAL = 4;
+static const int K = 10;
 
-static llama_tokens generate_draft_from_ngram(std::vector<llama_token>& prompt_tgt, common_ngram_cache& ngram_cache) {
-    llama_tokens draft;
+// Commenting out the old ngram-cache related code
+// static llama_tokens generate_draft_from_ngram(std::vector<llama_token>& prompt_tgt, common_ngram_cache& ngram_cache) {
+//     llama_tokens draft;
     
-    // Try different n-gram lengths, from longest to shortest
+//     // Try different n-gram lengths, from longest to shortest
+//     for (size_t n = N_RETRIEVAL; n > 0; --n) {
+//         if (prompt_tgt.size() >= n) {
+//             // Get the last n tokens from the prompt
+//             std::vector<llama_token> last_n_tokens(prompt_tgt.end() - n, prompt_tgt.end());
+
+//             // Get the n-gram candidates for the last n tokens
+//             auto it = ngram_cache.find(common_ngram(last_n_tokens.data(), n));
+//             if (it != ngram_cache.end() && !it->second.empty()) {
+//                 // Find the candidate with the highest frequency
+//                 auto best_candidate = std::max_element(
+//                     it->second.begin(), it->second.end(),
+//                     [](const auto& a, const auto& b) { return a.second < b.second; }
+//                 );
+
+//                 // Add the best candidate to the draft
+//                 draft.push_back(best_candidate->first);
+//                 break; // Exit the loop once a candidate is found
+//             }
+//         }
+//     }
+
+//     return draft;
+// }
+
+llama_tokens generate_draft_from_ngram_custom(std::vector<llama_token>& prompt_tgt, std::map<std::vector<llama_token>, std::vector<llama_token>>& custom_cache, bool& draft_exists, llama_context* ctx_tgt) {
+    llama_tokens draft(K, -1); // Initialize draft with K spaces
+    size_t prompt_size = prompt_tgt.size();
+    draft_exists = false; // Initialize as false
+
+    // Start with the maximum n-gram length and decrease
     for (size_t n = N_RETRIEVAL; n > 0; --n) {
-        if (prompt_tgt.size() >= n) {
+        if (prompt_size >= n) {
             // Get the last n tokens from the prompt
             std::vector<llama_token> last_n_tokens(prompt_tgt.end() - n, prompt_tgt.end());
-
-            // Get the n-gram candidates for the last n tokens
-            auto it = ngram_cache.find(common_ngram(last_n_tokens.data(), n));
-            if (it != ngram_cache.end() && !it->second.empty()) {
-                // Find the candidate with the highest frequency
-                auto best_candidate = std::max_element(
-                    it->second.begin(), it->second.end(),
-                    [](const auto& a, const auto& b) { return a.second < b.second; }
-                );
-
-                // Add the best candidate to the draft
-                draft.push_back(best_candidate->first);
-                break; // Exit the loop once a candidate is found
+            std::string tokens_str;
+            for (const auto& token : last_n_tokens) {
+                tokens_str += common_token_to_piece(ctx_tgt, token) + " ";
+            }
+            LOG_INF("Check last %d tokens: %s\n", n, tokens_str.c_str());
+            try {
+                // Check if these tokens exist in the custom cache
+                auto it = custom_cache.find(last_n_tokens);
+                if (it != custom_cache.end()) {
+                    // Convert the draft vector to a string for logging, excluding -1 values
+                    std::string draft_str;
+                    for (const auto& token : it->second) {
+                        if (token != -1) { // Exclude padding
+                            draft_str += common_token_to_piece(ctx_tgt, token) + " ";
+                        }
+                    }
+                    LOG_INF("Found draft for key: ");
+                    for (const auto& token : last_n_tokens) {
+                        LOG_INF("%s(%d) ", common_token_to_piece(ctx_tgt, token).c_str(), token);
+                    }
+                    LOG_INF("\nDraft: %s\n", draft_str.c_str());
+                    draft = it->second;
+                    draft_exists = true; // Set to true if a draft is found
+                    break; // Exit the loop once a match is found
+                } else {
+                    LOG_INF("No draft found for key: ");
+                    for (const auto& token : last_n_tokens) {
+                        LOG_INF("%s(%d) ", common_token_to_piece(ctx_tgt, token).c_str(), token);
+                    }
+                    LOG_INF("\n");
+                }
+            } catch (const std::exception& e) {
+                LOG_ERR("Exception occurred: %s\n", e.what());
+            } catch (...) {
+                LOG_ERR("Unknown exception occurred\n");
             }
         }
     }
 
+    // Remove -1 values from the draft
+    if (draft_exists) {
+        draft.erase(std::remove(draft.begin(), draft.end(), -1), draft.end());
+        // Convert the draft vector to a string for logging, excluding -1 values
+        std::string draft_str;
+        for (const auto& token : draft) {
+            draft_str += common_token_to_piece(ctx_tgt, token) + " ";
+        }
+        LOG_INF("Draft after erasing -1: %s\n", draft_str.c_str());
+    }
+
+    
+
     return draft;
 }
+
 static llama_tokens generate_dummy_draft_tokens(llama_context* ctx_tgt) {
     // Dummy string to tokenize
     std::string dummy_string = "Hillary Clinton";
@@ -51,6 +119,32 @@ static llama_tokens generate_dummy_draft_tokens(llama_context* ctx_tgt) {
     // Tokenize the dummy string
     llama_tokens draft = common_tokenize(ctx_tgt, dummy_string, true, true);
     return draft;
+}
+
+// Function to construct a custom cache from the prompt
+std::map<std::vector<llama_token>, std::vector<llama_token>> construct_custom_cache(const std::vector<llama_token>& input, int n_retrieval, int k) {
+    std::map<std::vector<llama_token>, std::vector<llama_token>> custom_cache;
+    size_t input_size = input.size();
+
+    for (size_t i = 0; i < input_size; ++i) {
+        for (int j = 0; j < n_retrieval; ++j) {
+            std::vector<llama_token> key(n_retrieval, -1);
+            std::vector<llama_token> value(k, -1);
+
+            // Fill the key
+            for (int m = 0; m <= j && i + m < input_size; ++m) {
+                key[m] = input[i + m];
+            }
+
+            // Fill the value
+            for (int n = 0; n < k && i + j + 1 + n < input_size; ++n) {
+                value[n] = input[i + j + 1 + n];
+            }
+
+            custom_cache[key] = value;
+        }
+    }
+    return custom_cache;
 }
 
 int main(int argc, char ** argv) {
@@ -180,55 +274,85 @@ int main(int argc, char ** argv) {
 
     const auto t_enc_end = ggml_time_us();
 
-    // Fill the n-gram cache with tokens from the prompt
-    common_ngram_cache ngram_cache;
-    const auto t_ngram_cache_start = ggml_time_us(); // Start timing
-    common_ngram_cache_update(ngram_cache, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, inp.size(), false);
-    const auto t_ngram_cache_end = ggml_time_us(); // End timing
-
-    // Log the time taken to build the n-gram cache
-    LOG_INF("Time taken to build n-gram cache from the prompt: %.3f seconds\n", (t_ngram_cache_end - t_ngram_cache_start) / 1e6f);
-
-    // Log the contents of the n-gram cache
-    LOG("\nContents of the n-gram cache:\n");
-    std::map<std::string, std::vector<std::string>> sorted_entries;
-
-    for (const auto& entry : ngram_cache) {
-        // Detokenize the n-gram
-        std::string ngram_text;
-        for (const auto& token : entry.first.tokens) {
-            if (token != -1) {
-                ngram_text += common_token_to_piece(ctx_tgt, token) + " (" + std::to_string(token) + ") "; // Include token ID
-            }
-        }
-        ngram_text = ngram_text.substr(0, ngram_text.size() - 1); // Remove trailing space
-
-        // Prepare candidates
-        std::vector<std::string> candidates_text;
-        for (const auto& candidate : entry.second) {
-            if (candidate.first != -1) {
-                candidates_text.push_back(common_token_to_piece(ctx_tgt, candidate.first) + " (" + std::to_string(candidate.first) + ")"); // Detokenize candidate and include ID
-            }
-        }
-
-        // Store in the map
-        sorted_entries[ngram_text] = candidates_text; // Map n-gram text to its candidates
-    }
-
-    // Log sorted entries, limiting to the first 50
+    std::map<std::vector<llama_token>, std::vector<llama_token>> custom_cache = construct_custom_cache(inp, N_RETRIEVAL, K);
+    LOG("Custom cache constructed with %zu entries\n", custom_cache.size());
+    // Log the custom cache with checks
+    LOG("\nCustom Cache Contents:\n");
     int count = 0;
-    for (const auto& [ngram, candidates] : sorted_entries) {
-        LOG("%s → ", ngram.c_str());
-        for (const auto& candidate : candidates) {
-            LOG("%s ", candidate.c_str());
+    for (const auto& [key, value] : custom_cache) {
+        LOG("Key: ");
+        for (const auto& token : key) {
+            if (token != -1 && ctx_tgt) {
+                LOG("%s(%d) ", common_token_to_piece(ctx_tgt, token).c_str(), token);
+            } else {
+                LOG("Invalid(%d) ", token);
+            }
+        }
+        LOG(" -> Value: ");
+        for (const auto& token : value) {
+            if (token != -1 && ctx_tgt) {
+                LOG("%s(%d) ", common_token_to_piece(ctx_tgt, token).c_str(), token);
+            } else {
+                LOG("Invalid(%d) ", token);
+            }
         }
         LOG("\n");
-
+        
         count++;
-        if (count >= 100) {
-            break; // Limit to first 50 entries
+        if (count >= 20) {
+            break;
         }
     }
+
+    // Commenting out the ngram-cache initialization and usage
+    // common_ngram_cache ngram_cache;
+    // const auto t_ngram_cache_start = ggml_time_us(); // Start timing
+    // common_ngram_cache_update(ngram_cache, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, inp.size(), false);
+    // const auto t_ngram_cache_end = ggml_time_us(); // End timing
+
+    // Log the time taken to build the n-gram cache
+    // LOG_INF("Time taken to build n-gram cache from the prompt: %.3f seconds\n", (t_ngram_cache_end - t_ngram_cache_start) / 1e6f);
+
+    // Log the contents of the n-gram cache
+    // LOG("\nContents of the n-gram cache:\n");
+    // std::map<std::string, std::vector<std::string>> sorted_entries;
+
+    // for (const auto& entry : ngram_cache) {
+    //     // Detokenize the n-gram
+    //     std::string ngram_text;
+    //     for (const auto& token : entry.first.tokens) {
+    //         if (token != -1) {
+    //             ngram_text += common_token_to_piece(ctx_tgt, token) + " (" + std::to_string(token) + ") "; // Include token ID
+    //         }
+    //     }
+    //     ngram_text = ngram_text.substr(0, ngram_text.size() - 1); // Remove trailing space
+
+    //     // Prepare candidates
+    //     std::vector<std::string> candidates_text;
+    //     for (const auto& candidate : entry.second) {
+    //         if (candidate.first != -1) {
+    //             candidates_text.push_back(common_token_to_piece(ctx_tgt, candidate.first) + " (" + std::to_string(candidate.first) + ")"); // Detokenize candidate and include ID
+    //         }
+    //     }
+
+    //     // Store in the map
+    //     sorted_entries[ngram_text] = candidates_text; // Map n-gram text to its candidates
+    // }
+
+    // Log sorted entries, limiting to the first 50
+    // int count = 0;
+    // for (const auto& [ngram, candidates] : sorted_entries) {
+    //     LOG("%s → ", ngram.c_str());
+    //     for (const auto& candidate : candidates) {
+    //         LOG("%s ", candidate.c_str());
+    //     }
+    //     LOG("\n");
+
+    //     count++;
+    //     if (count >= 100) {
+    //         break; // Limit to first 50 entries
+    //     }
+    // }
 
     const auto t_dec_start = ggml_time_us(); // Decoding Phase Start
     std::vector<double> draft_times;
@@ -246,7 +370,8 @@ int main(int argc, char ** argv) {
         auto t_draft_start = ggml_time_us(); 
         // llama_tokens draft = common_speculative_gen_draft(spec, params_spec, prompt_tgt, id_last);
         // llama_tokens draft = generate_dummy_draft_tokens(ctx_tgt);
-        llama_tokens draft = generate_draft_from_ngram(prompt_tgt, ngram_cache);
+        bool draft_exists;
+        llama_tokens draft = generate_draft_from_ngram_custom(prompt_tgt, custom_cache, draft_exists, ctx_tgt);
 
         auto t_draft_end = ggml_time_us(); 
         draft_times.push_back((t_draft_end - t_draft_start) / 1e3);
@@ -264,20 +389,22 @@ int main(int argc, char ** argv) {
         }
         // evaluate the target model on [id_last, draft0, draft1, ..., draftN-1]
         {
-            // do not waste time on small drafts
-            if (draft.size() < (size_t) n_draft_min) {
+            // do not waste time on small drafts or when no draft exists
+            if (!draft_exists || draft.size() < (size_t) n_draft_min) {
                 draft.clear();
             }
 
-            for (size_t i = 0; i < draft.size(); ++i) {
-                common_batch_add(batch_tgt, draft[i], n_past + i, { 0 }, true);
-            }
+            if (draft_exists && !draft.empty()) {
+                for (size_t i = 0; i < draft.size(); ++i) {
+                    common_batch_add(batch_tgt, draft[i], n_past + i, { 0 }, true);
+                }
 
-            //LOG_DBG("target batch: %s\n", string_from(ctx_tgt, batch_tgt).c_str());
-            auto t_verify_start = ggml_time_us();
-            llama_decode(ctx_tgt, batch_tgt);
-            auto t_verify_end = ggml_time_us();
-            verify_times.push_back((t_verify_end - t_verify_start) / 1e3);
+                //LOG_DBG("target batch: %s\n", string_from(ctx_tgt, batch_tgt).c_str());
+                auto t_verify_start = ggml_time_us();
+                llama_decode(ctx_tgt, batch_tgt);
+                auto t_verify_end = ggml_time_us();
+                verify_times.push_back((t_verify_end - t_verify_start) / 1e3);
+            }
         }
 
         // sample from the full target batch and return the accepted tokens based on the target sampler
