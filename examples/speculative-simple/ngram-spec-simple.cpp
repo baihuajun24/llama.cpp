@@ -4,14 +4,47 @@
 #include "speculative.h"
 #include "log.h"
 #include "llama.h"
+#include "ngram-cache.h"
 
+# include <map>
+# include <algorithm>
+# include <string>
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
 #include <numeric> // For std::accumulate
 
-llama_tokens generate_dummy_draft_tokens(llama_context* ctx_tgt) {
+static const int N_RETRIEVAL = 4;
+
+static llama_tokens generate_draft_from_ngram(std::vector<llama_token>& prompt_tgt, common_ngram_cache& ngram_cache) {
+    llama_tokens draft;
+    
+    // Try different n-gram lengths, from longest to shortest
+    for (size_t n = N_RETRIEVAL; n > 0; --n) {
+        if (prompt_tgt.size() >= n) {
+            // Get the last n tokens from the prompt
+            std::vector<llama_token> last_n_tokens(prompt_tgt.end() - n, prompt_tgt.end());
+
+            // Get the n-gram candidates for the last n tokens
+            auto it = ngram_cache.find(common_ngram(last_n_tokens.data(), n));
+            if (it != ngram_cache.end() && !it->second.empty()) {
+                // Find the candidate with the highest frequency
+                auto best_candidate = std::max_element(
+                    it->second.begin(), it->second.end(),
+                    [](const auto& a, const auto& b) { return a.second < b.second; }
+                );
+
+                // Add the best candidate to the draft
+                draft.push_back(best_candidate->first);
+                break; // Exit the loop once a candidate is found
+            }
+        }
+    }
+
+    return draft;
+}
+static llama_tokens generate_dummy_draft_tokens(llama_context* ctx_tgt) {
     // Dummy string to tokenize
     std::string dummy_string = "Hillary Clinton";
     
@@ -147,6 +180,56 @@ int main(int argc, char ** argv) {
 
     const auto t_enc_end = ggml_time_us();
 
+    // Fill the n-gram cache with tokens from the prompt
+    common_ngram_cache ngram_cache;
+    const auto t_ngram_cache_start = ggml_time_us(); // Start timing
+    common_ngram_cache_update(ngram_cache, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, inp.size(), false);
+    const auto t_ngram_cache_end = ggml_time_us(); // End timing
+
+    // Log the time taken to build the n-gram cache
+    LOG_INF("Time taken to build n-gram cache from the prompt: %.3f seconds\n", (t_ngram_cache_end - t_ngram_cache_start) / 1e6f);
+
+    // Log the contents of the n-gram cache
+    LOG("\nContents of the n-gram cache:\n");
+    std::map<std::string, std::vector<std::string>> sorted_entries;
+
+    for (const auto& entry : ngram_cache) {
+        // Detokenize the n-gram
+        std::string ngram_text;
+        for (const auto& token : entry.first.tokens) {
+            if (token != -1) {
+                ngram_text += common_token_to_piece(ctx_tgt, token) + " (" + std::to_string(token) + ") "; // Include token ID
+            }
+        }
+        ngram_text = ngram_text.substr(0, ngram_text.size() - 1); // Remove trailing space
+
+        // Prepare candidates
+        std::vector<std::string> candidates_text;
+        for (const auto& candidate : entry.second) {
+            if (candidate.first != -1) {
+                candidates_text.push_back(common_token_to_piece(ctx_tgt, candidate.first) + " (" + std::to_string(candidate.first) + ")"); // Detokenize candidate and include ID
+            }
+        }
+
+        // Store in the map
+        sorted_entries[ngram_text] = candidates_text; // Map n-gram text to its candidates
+    }
+
+    // Log sorted entries, limiting to the first 50
+    int count = 0;
+    for (const auto& [ngram, candidates] : sorted_entries) {
+        LOG("%s → ", ngram.c_str());
+        for (const auto& candidate : candidates) {
+            LOG("%s ", candidate.c_str());
+        }
+        LOG("\n");
+
+        count++;
+        if (count >= 100) {
+            break; // Limit to first 50 entries
+        }
+    }
+
     const auto t_dec_start = ggml_time_us(); // Decoding Phase Start
     std::vector<double> draft_times;
     std::vector<double> verify_times;
@@ -162,7 +245,8 @@ int main(int argc, char ** argv) {
         //
         auto t_draft_start = ggml_time_us(); 
         // llama_tokens draft = common_speculative_gen_draft(spec, params_spec, prompt_tgt, id_last);
-        llama_tokens draft = generate_dummy_draft_tokens(ctx_tgt);
+        // llama_tokens draft = generate_dummy_draft_tokens(ctx_tgt);
+        llama_tokens draft = generate_draft_from_ngram(prompt_tgt, ngram_cache);
 
         auto t_draft_end = ggml_time_us(); 
         draft_times.push_back((t_draft_end - t_draft_start) / 1e3);
