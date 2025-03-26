@@ -115,6 +115,8 @@ int main(int argc, char ** argv){
 
     const auto t_dec_start = ggml_time_us();
 
+    std::vector<int64_t> draft_times; // Vector to store each draft time
+
     while (true) {
         // debug
         if (dump_kv_cache) {
@@ -201,14 +203,19 @@ int main(int argc, char ** argv){
         GGML_ASSERT(draft.size() == 1);
         GGML_ASSERT(draft[0] == inp.back());
         const int64_t t_start_draft_us = ggml_time_us();
+        // LOG_INF("Starting draft at: %lld us\n", t_start_draft_us);
 
         common_ngram_cache_draft(inp, draft, n_draft, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, ngram_cache_context, ngram_cache_dynamic, ngram_cache_static);
 
         for (size_t i = 1; i < draft.size(); ++i) {
             common_batch_add(batch_tgt, draft[i], n_past + i, { 0 }, true);
         }
-
-        t_draft_us += ggml_time_us() - t_start_draft_us;
+        const int64_t t_end_draft_us = ggml_time_us();
+        // LOG_INF("Ending draft at: %lld us\n", t_end_draft_us);
+        int64_t draft_time = t_end_draft_us - t_start_draft_us;
+        draft_times.push_back(draft_time); // Append draft time to the vector
+        // LOG_INF("Draft time %zu: %.3f us\n", draft_times.size(), static_cast<double>(draft_time));
+        t_draft_us += draft_time;
         n_drafted += draft.size() - 1;
 
         llama_decode(ctx, batch_tgt);
@@ -219,11 +226,25 @@ int main(int argc, char ** argv){
 
     auto t_dec_end = ggml_time_us();
 
+    // // Calculate and log each draft time
+    // for (size_t i = 0; i < draft_times.size(); ++i) {
+    //     LOG_INF("Draft time %zu: %.3f us\n", i + 1, static_cast<double>(draft_times[i]));
+    // }
+    // Calculate average draft time
+    double avg_draft_time = 0;
+    for (const auto& time : draft_times) {
+        avg_draft_time += time;
+    }
+    avg_draft_time /= draft_times.size();
+
     // Update dynamic ngram cache with context ngram cache and save it to disk:
     common_ngram_cache_merge(ngram_cache_dynamic, ngram_cache_context);
     common_ngram_cache_save(ngram_cache_dynamic, params.lookup_cache_dynamic);
 
     LOG("\n\n");
+
+    LOG_INF("Average ngram draft time: %.3f us\n", avg_draft_time);
+    LOG_INF("Draft k setting: %d\n", n_draft); // Assuming n_draft is the draft_k setting
 
     LOG_INF("encoded %4d tokens in %8.3f seconds, speed: %8.3f t/s\n", n_input,   (t_enc_end - t_enc_start) / 1e6f, inp.size() / ((t_enc_end - t_enc_start) / 1e6f));
     LOG_INF("decoded %4d tokens in %8.3f seconds, speed: %8.3f t/s\n", n_predict, (t_dec_end - t_dec_start) / 1e6f, n_predict  / ((t_dec_end - t_dec_start) / 1e6f));

@@ -369,9 +369,9 @@ int main(int argc, char ** argv) {
         //
         auto t_draft_start = ggml_time_us(); 
         // llama_tokens draft = common_speculative_gen_draft(spec, params_spec, prompt_tgt, id_last);
-        // llama_tokens draft = generate_dummy_draft_tokens(ctx_tgt);
-        bool draft_exists;
-        llama_tokens draft = generate_draft_from_ngram_custom(prompt_tgt, custom_cache, draft_exists, ctx_tgt);
+        llama_tokens draft = generate_dummy_draft_tokens(ctx_tgt);
+        bool draft_exists = true;
+        //llama_tokens draft = generate_draft_from_ngram_custom(prompt_tgt, custom_cache, draft_exists, ctx_tgt);
 
         auto t_draft_end = ggml_time_us(); 
         draft_times.push_back((t_draft_end - t_draft_start) / 1e3);
