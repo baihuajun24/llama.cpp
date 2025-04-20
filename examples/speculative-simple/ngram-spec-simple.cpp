@@ -112,9 +112,12 @@ llama_tokens generate_draft_from_ngram_custom(std::vector<llama_token>& prompt_t
     return draft;
 }
 
-static llama_tokens generate_dummy_draft_tokens(llama_context* ctx_tgt) {
-    // Dummy string to tokenize
-    std::string dummy_string = "Hillary Clinton";
+static llama_tokens generate_dummy_draft_tokens(llama_context* ctx_tgt, size_t length = 2) {
+    // Generate dummy string with repeated tokens
+    std::string dummy_string;
+    for (size_t i = 0; i < length; i++) {
+        dummy_string += "token ";
+    }
     
     // Tokenize the dummy string
     llama_tokens draft = common_tokenize(ctx_tgt, dummy_string, true, true);
@@ -359,6 +362,8 @@ int main(int argc, char ** argv) {
     std::vector<double> verify_times;
     std::vector<double> target_sample_times;
     std::vector<double> one_iter_times;
+    int test_verify_counter = 0;
+    int max_test_verify_counter = 16;
     while (true) {
         // optionally, generate draft tokens that can be appended to the target batch
         //
@@ -369,7 +374,7 @@ int main(int argc, char ** argv) {
         //
         auto t_draft_start = ggml_time_us(); 
         // llama_tokens draft = common_speculative_gen_draft(spec, params_spec, prompt_tgt, id_last);
-        llama_tokens draft = generate_dummy_draft_tokens(ctx_tgt);
+        llama_tokens draft = generate_dummy_draft_tokens(ctx_tgt, test_verify_counter);
         bool draft_exists = true;
         //llama_tokens draft = generate_draft_from_ngram_custom(prompt_tgt, custom_cache, draft_exists, ctx_tgt);
 
@@ -464,6 +469,11 @@ int main(int argc, char ** argv) {
         }
         auto t_one_iter_end = ggml_time_us();
         one_iter_times.push_back((t_one_iter_end - t_draft_start) / 1e3);
+
+        test_verify_counter++;
+        if (test_verify_counter >= max_test_verify_counter) {
+            break;
+        }
     }
 
     auto t_dec_end = ggml_time_us();
@@ -489,6 +499,22 @@ int main(int argc, char ** argv) {
     double avg_target_sample_time = std::accumulate(target_sample_times.begin(), target_sample_times.end(), 0.0) / target_sample_times.size();
     double target_sample_percentage = (avg_target_sample_time / avg_one_iter_time) * 100.0;
     LOG_INF("Average target sample time: %.2f ms (%.2f%% of one iter time)\n", avg_target_sample_time, target_sample_percentage);
+
+    // Print arrays of times
+    LOG_INF("\nChecking verify times and target sample times for length = 1...16\n");
+    LOG_INF("\nVerify times (ms):     ");
+    for (const auto& time : verify_times) {
+        LOG_INF("%.2f ", time);
+    }
+    LOG_INF("\nTarget sample times (ms): ");
+    for (const auto& time : target_sample_times) {
+        LOG_INF("%.2f ", time);
+    }
+    LOG_INF("\nCombined times (ms):     ");
+    for (size_t i = 0; i < verify_times.size(); i++) {
+        LOG_INF("%.2f ", verify_times[i] + target_sample_times[i]);
+    }
+    LOG_INF("\n\n");
 
     LOG_INF("encoded %4d tokens in %8.3f seconds, speed: %8.3f t/s\n", n_input,   (t_enc_end - t_enc_start) / 1e6f, inp.size() / ((t_enc_end - t_enc_start) / 1e6f));
     LOG_INF("decoded %4d tokens in %8.3f seconds, speed: %8.3f t/s\n", n_predict, (t_dec_end - t_dec_start) / 1e6f, n_predict  / ((t_dec_end - t_dec_start) / 1e6f));

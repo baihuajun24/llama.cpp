@@ -21,9 +21,6 @@ int main(int argc, char ** argv){
 
     common_init();
 
-    std::stringstream generated_text;
-    bool write_to_file = !params.out_file.empty();
-
     // max. number of additional tokens to draft if match is found
     const int n_draft = params.speculative.n_max;
 
@@ -102,8 +99,6 @@ int main(int argc, char ** argv){
     int n_predict = 0;
     int n_drafted = 0;
     int n_accept  = 0;
-    // a list for n_accept
-    std::vector<int> n_accept_list;
 
     int n_past = inp.size();
 
@@ -120,6 +115,8 @@ int main(int argc, char ** argv){
 
     const auto t_dec_start = ggml_time_us();
 
+    std::vector<int64_t> draft_times; // Vector to store each draft time
+
     while (true) {
         // debug
         if (dump_kv_cache) {
@@ -131,7 +128,6 @@ int main(int argc, char ** argv){
         LOG_DBG("drafted %s\n", string_from(ctx, draft).c_str());
 
         int i_dft = 0;
-        int accept_length = 0;
         while (true) {
             // sample from the target model
             llama_token id = common_sampler_sample(smpl, ctx, i_dft);
@@ -154,7 +150,6 @@ int main(int argc, char ** argv){
             if (i_dft < (int) draft.size() && id == draft[i_dft]) {
                 LOG_DBG("the sampled target token matches the %dth drafted token (%d, '%s') - accepted\n", i_dft, id, token_str.c_str());
                 ++n_accept;
-                accept_length += 1;
                 ++n_past;
                 ++i_dft;
                 inp.push_back(id);
@@ -165,16 +160,18 @@ int main(int argc, char ** argv){
                     t_draft_us += ggml_time_us() - t_start_draft_us;
                 }
 
-                if (write_to_file) {
-                    generated_text << token_str;
+                if (params.use_color) {
+                    // color accepted draft token
+                    LOG("\033[34m%s\033[0m", token_str.c_str());
+                    fflush(stdout);
                 }
-
                 continue;
             }
 
-            if (write_to_file) {
-                generated_text << token_str;
+            if (params.use_color) {
+                LOG("%s", token_str.c_str());
             }
+            fflush(stdout);
 
 
             LOG_DBG("the sampled target token (%d, '%s') did not match, or we ran out of drafted tokens\n", id, token_str.c_str());
@@ -190,8 +187,7 @@ int main(int argc, char ** argv){
             }
             break;
         }
-        n_accept_list.push_back(std::max(accept_length, 1));
-        
+
         if ((params.n_predict > 0 && n_predict > params.n_predict) || has_eos) {
             break;
         }
@@ -207,14 +203,19 @@ int main(int argc, char ** argv){
         GGML_ASSERT(draft.size() == 1);
         GGML_ASSERT(draft[0] == inp.back());
         const int64_t t_start_draft_us = ggml_time_us();
+        // LOG_INF("Starting draft at: %lld us\n", t_start_draft_us);
 
         common_ngram_cache_draft(inp, draft, n_draft, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, ngram_cache_context, ngram_cache_dynamic, ngram_cache_static);
 
         for (size_t i = 1; i < draft.size(); ++i) {
             common_batch_add(batch_tgt, draft[i], n_past + i, { 0 }, true);
         }
-
-        t_draft_us += ggml_time_us() - t_start_draft_us;
+        const int64_t t_end_draft_us = ggml_time_us();
+        // LOG_INF("Ending draft at: %lld us\n", t_end_draft_us);
+        int64_t draft_time = t_end_draft_us - t_start_draft_us;
+        draft_times.push_back(draft_time); // Append draft time to the vector
+        // LOG_INF("Draft time %zu: %.3f us\n", draft_times.size(), static_cast<double>(draft_time));
+        t_draft_us += draft_time;
         n_drafted += draft.size() - 1;
 
         llama_decode(ctx, batch_tgt);
@@ -225,51 +226,28 @@ int main(int argc, char ** argv){
 
     auto t_dec_end = ggml_time_us();
 
+    // // Calculate and log each draft time
+    // for (size_t i = 0; i < draft_times.size(); ++i) {
+    //     LOG_INF("Draft time %zu: %.3f us\n", i + 1, static_cast<double>(draft_times[i]));
+    // }
+    // Calculate average draft time
+    double avg_draft_time = 0;
+    for (const auto& time : draft_times) {
+        avg_draft_time += time;
+    }
+    avg_draft_time /= draft_times.size();
+
     // Update dynamic ngram cache with context ngram cache and save it to disk:
     common_ngram_cache_merge(ngram_cache_dynamic, ngram_cache_context);
     common_ngram_cache_save(ngram_cache_dynamic, params.lookup_cache_dynamic);
 
     LOG("\n\n");
 
+    LOG_INF("Average ngram draft time: %.3f us\n", avg_draft_time);
+    LOG_INF("Draft k setting: %d\n", n_draft); // Assuming n_draft is the draft_k setting
+
     LOG_INF("encoded %4d tokens in %8.3f seconds, speed: %8.3f t/s\n", n_input,   (t_enc_end - t_enc_start) / 1e6f, inp.size() / ((t_enc_end - t_enc_start) / 1e6f));
     LOG_INF("decoded %4d tokens in %8.3f seconds, speed: %8.3f t/s\n", n_predict, (t_dec_end - t_dec_start) / 1e6f, n_predict  / ((t_dec_end - t_dec_start) / 1e6f));
-
-    // print n_accept_list and average
-    float sum = 0;
-    for (size_t i = 0; i < n_accept_list.size(); i++) {
-        sum += n_accept_list[i];
-    }
-    float average = sum / n_accept_list.size();
-
-    // Format the vector as a string
-    std::string accept_list_str = "[";
-    for (size_t i = 0; i < n_accept_list.size(); i++) {
-        accept_list_str += std::to_string(n_accept_list[i]);
-        if (i < n_accept_list.size() - 1) {
-            accept_list_str += ", ";
-        }
-    }
-    accept_list_str += "]";
-    LOG_INF("0420 Check: n_accept_list = %s\n", accept_list_str.c_str());
-    LOG_INF("0420 Check: accept length average      = %.3f\n", average);
-
-    // Write to file if requested
-    if (write_to_file) {
-        std::ofstream output_file(params.out_file);
-        if (!output_file.is_open()) {
-            LOG_ERR("Failed to open output file: %s\n", params.out_file.c_str());
-        } else {
-            // First write the statistics as the first 3 lines
-            output_file << "# Tokens: " << n_predict << ", Speed: " 
-                    << (n_predict  / ((t_dec_end - t_dec_start) / 1e6f)) << " t/s\n";
-            output_file << "# Accept length average: " << average << "\n";
-            output_file << "# Accept length list: " << accept_list_str << "\n";
-            // Write all collected text at once
-            output_file << generated_text.str();
-            output_file.close();
-            LOG_INF("Generated text written to: %s\n", params.out_file.c_str());
-        }
-    }
 
     LOG_INF("\n");
     LOG_INF("n_draft      = %d\n", n_draft);
