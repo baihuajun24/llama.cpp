@@ -342,3 +342,158 @@ void print_ngram_index_stats(const ngram_index& index) {
         LOG_INF("    %d-grams: %d patterns\n", s.first, s.second);
     }
 }
+
+void ngram_index_update(
+    ngram_index& index,
+    const std::vector<llama_token>& tokens,
+    int ngram_min,
+    int ngram_max,
+    int n_tokens,
+    bool reset)
+{
+    // For a static index, this can be a no-op
+    // In a dynamic scenario, we would update the index with new tokens
+    // For this implementation, we'll make it a no-op since we're using a static index
+    
+    // NOTE: If you want to implement dynamic updates, you'd do something like:
+    // if (reset) {
+    //     index.clear();
+    // }
+    // 
+    // int start_pos = tokens.size() - n_tokens;
+    // if (start_pos < 0) start_pos = 0;
+    // 
+    // for (int n = ngram_min; n <= ngram_max; ++n) {
+    //     for (int pos = start_pos; pos <= tokens.size() - n; ++pos) {
+    //         ngram_index_key key(&tokens[pos], n, ngram_max);
+    //         index[key].push_back(pos);
+    //     }
+    // }
+    
+    // For now, we'll just log that this function was called
+    LOG_DBG("ngram_index_update called with %d tokens (no-op for static index)\n", n_tokens);
+}
+
+void ngram_index_draft(
+    const std::vector<llama_token>& inp,
+    std::vector<llama_token>& draft,
+    int n_draft,
+    int ngram_min,
+    int ngram_max,
+    const ngram_index& index,
+    const std::vector<llama_token>& index_tokens,
+    int selection_strategy)
+{
+    // Validate input
+    if (inp.empty() || draft.empty() || index_tokens.empty()) {
+        LOG_DBG("Empty inputs, cannot draft\n");
+        return;
+    }
+    
+    // Get the last token of inp (which should match draft[0])
+    llama_token last_token = inp.back();
+    
+    // Make sure draft starts with last_token
+    if (draft[0] != last_token) {
+        LOG_DBG("Draft first token doesn't match input last token\n");
+        return;
+    }
+    
+    // Keep appending tokens until we reach n_draft
+    // This follows the pattern in common_ngram_cache_draft
+    while (draft.size() - 1 < n_draft) {
+        // Flag to track if we found a continuation
+        bool found_continuation = false;
+        
+        // Try with different n-gram sizes, starting with the largest
+        for (int n = std::min(ngram_max, (int)inp.size() + (int)draft.size() - 1); n >= ngram_min && !found_continuation; --n) {
+            // Skip if there aren't enough tokens for this n-gram
+            if ((int)inp.size() + (int)draft.size() - 1 < n) continue;
+            
+            // Build context from the last n tokens of input+draft
+            std::vector<llama_token> context;
+            context.reserve(n);
+            
+            // Get tokens from input and draft
+            for (int i = 0; i < n; ++i) {
+                int pos = inp.size() + draft.size() - 1 - n + i;
+                
+                // If position is in input
+                if (pos < (int)inp.size()) {
+                    context.push_back(inp[pos]);
+                }
+                // If position is in draft
+                else {
+                    context.push_back(draft[pos - inp.size()]);
+                }
+            }
+            
+            // Create key from context
+            ngram_index_key key(context.data(), n, ngram_max);
+            
+            // Debug info about context
+            std::string context_str = "";
+            for (auto t : context) {
+                context_str += std::to_string(t) + " ";
+            }
+            LOG_DBG("Looking up %d-gram context: %s\n", n, context_str.c_str());
+            
+            // Look up in index
+            auto it = index.find(key);
+            if (it == index.end() || it->second.empty()) {
+                // No match, try smaller n-gram
+                continue;
+            }
+            
+            // Found a match!
+            LOG_DBG("Found match for %d-gram in index with %zu positions\n", n, it->second.size());
+            
+            // Select a position based on strategy
+            int selected_idx = 0;
+            if (selection_strategy == 1 && it->second.size() > 1) {  // Random
+                static std::random_device rd;
+                static std::mt19937 gen(rd());
+                std::uniform_int_distribution<> dis(0, it->second.size() - 1);
+                selected_idx = dis(gen);
+            }
+            
+            int position = it->second[selected_idx];
+            LOG_DBG("Selected position %d in index\n", position);
+            
+            // Calculate how many tokens we can take after this position
+            int tokens_remaining = n_draft - (draft.size() - 1);
+            int tokens_available = index_tokens.size() - (position + n);
+            int tokens_to_take = std::min(tokens_remaining, tokens_available);
+            
+            if (tokens_to_take <= 0) {
+                LOG_DBG("Not enough tokens after position %d in index\n", position + n);
+                continue;
+            }
+            
+            // Add the sequence of tokens to the draft
+            for (int i = 0; i < tokens_to_take; i++) {
+                llama_token next_token = index_tokens[position + n + i];
+                draft.push_back(next_token);
+            }
+            found_continuation = true;
+            
+            // Log the updated draft
+            std::string draft_str = "Draft now: ";
+            for (auto t : draft) {
+                draft_str += std::to_string(t) + " ";
+            }
+            LOG_INF("%s\n", draft_str.c_str());
+            
+            // Break from n-gram size loop since we found a continuation
+            break;
+        }
+        
+        // If we couldn't find a continuation, stop drafting
+        if (!found_continuation) {
+            LOG_DBG("Could not find continuation for current context, stopping draft at %zu tokens\n", draft.size());
+            break;
+        }
+    }
+    
+    LOG_DBG("Final draft size: %zu tokens\n", draft.size());
+}

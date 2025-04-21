@@ -365,6 +365,7 @@ int main(int argc, char** argv) {
     // Track performance metrics
     const auto t_enc_start = ggml_time_us();
     
+    int64_t t_draft_us = 0;
     // Encode prompt
     llama_decode(ctx, llama_batch_get_one(inp.data(), n_input - 1));
     llama_decode(ctx, llama_batch_get_one(&inp.back(), 1));
@@ -386,151 +387,108 @@ int main(int argc, char** argv) {
     
     const auto t_dec_start = ggml_time_us();
     
-    // Main generation loop
     while (true) {
-        // Clear previous draft
-        draft.clear();
-        
-        // Debug log current draft sequence
-        LOG_DBG("drafted %s\n", string_from(ctx, draft).c_str());
-        
+
         int i_dft = 0;
         int accept_length = 0;
-        
-        // Sample first token
-        llama_token id = common_sampler_sample(smpl, ctx, i_dft);
-        common_sampler_accept(smpl, id, true);
-        
-        const std::string token_str = common_token_to_piece(ctx, id);
-        
-        LOG("%s", token_str.c_str());
-        
-        if (llama_vocab_is_eog(vocab, id)) {
-            has_eos = true;
-        }
-        
-        ++n_predict;
-        
-        // Initialize draft with this token
-        draft.push_back(id);
-        inp.push_back(id);
-        
-        // Record first token
-        if (write_to_file) {
-            generated_text << token_str;
-        }
-        
-        // Draft additional tokens using n-gram index
-        if (!nindex.empty()) {
-            LOG_DBG("Before drafting: inp.size=%zu, draft.size=%zu\n", 
-                    inp.size(), draft.size());
-            
-            // Count existing drafted tokens
-            int pre_draft_size = draft.size();
-            
-            // Draft tokens using n-gram index
-            draft_with_ngram_index(
-                inp,
-                draft,
-                n_draft,
-                index_tokens.empty() ? inp : index_tokens, // Use prompt if no index tokens
-                nindex,
-                idx_params.ngram_min,
-                idx_params.ngram_max,
-                idx_params.selection_strategy);
-            
-            // Count how many new tokens were added
-            int newly_drafted = draft.size() - pre_draft_size;
-            LOG_DBG("Drafted %d additional tokens\n", newly_drafted);
-            
-            // Track total drafts for statistics
-            n_drafted += newly_drafted;
-            
-            // Debug print the drafted sequence
-            LOG_DBG("drafted %s\n", string_from(ctx, draft).c_str());
-        }
-        
-        // Must remove first token since it's already been processed and added to input
-        if (draft.size() > 1) {
-            draft.erase(draft.begin());
-        } else {
-            // No tokens were drafted, continue to next iteration
-            n_accept_list.push_back(1); // Record 1 token acceptance
-            
-            // Check if we've generated enough tokens or reached EOS
-            if ((params.n_predict > 0 && n_predict >= params.n_predict) || has_eos) {
-                break;
-            }
-            
-            // Prepare for next token
-            n_past = inp.size();
-            continue;
-        }
-        
-        // Inner verification loop: verify each drafted token
-        while (!draft.empty()) {
-            // Prepare batch for next token
-            common_batch_clear(batch_tgt);
-            common_batch_add(batch_tgt, draft[0], n_past, { 0 }, true);
-            
-            // Decode
-            llama_decode(ctx, batch_tgt);
-            
-            // Sample from model
-            id = common_sampler_sample(smpl, ctx, i_dft);
+        int debug_count = 0; // for test
+        while (debug_count < 1000) {
+            debug_count++;
+            // sample from the target model
+            llama_token id = common_sampler_sample(smpl, ctx, i_dft);
+
             common_sampler_accept(smpl, id, true);
-            
-            const std::string drafted_token_str = common_token_to_piece(ctx, id);
-            LOG("%s", drafted_token_str.c_str());
-            
+
+            const std::string token_str = common_token_to_piece(ctx, id);
+
+            if (llama_vocab_is_eog(vocab, id)) {
+                has_eos = true;
+            }
+
             ++n_predict;
-            
-            // Check if token matches our drafted token
-            if (id == draft[0]) {
-                // Match! Accept the token
-                LOG_DBG("the sampled target token matches the drafted token (%d, '%s') - accepted\n", 
-                        id, drafted_token_str.c_str());
+
+            // check if the target token matches the draft
+            if (i_dft < (int) draft.size() && id == draft[i_dft]) {
+                LOG_INF("the sampled target token matches the %dth drafted token (%d, '%s') - accepted\n", i_dft, id, token_str.c_str());
                 ++n_accept;
-                ++accept_length;
+                accept_length += 1;
                 ++n_past;
                 ++i_dft;
                 inp.push_back(id);
-                
-                if (write_to_file) {
-                    generated_text << drafted_token_str;
+                {
+                    // Update context ngram cache with the newly accepted token:
+                    const int64_t t_start_draft_us = ggml_time_us();
+                    ngram_index_update(nindex, inp, params.ngram_min, params.ngram_max, 1, false);
+                    t_draft_us += ggml_time_us() - t_start_draft_us;
                 }
-                
-                // Remove the accepted token from draft
-                draft.erase(draft.begin());
-            } else {
-                // No match, stop drafting
-                LOG_DBG("the sampled target token (%d, '%s') did not match the drafted token (%d, '%s')\n", 
-                        id, drafted_token_str.c_str(), draft[0], common_token_to_piece(ctx, draft[0]).c_str());
-                
+
                 if (write_to_file) {
-                    generated_text << drafted_token_str;
+                    generated_text << token_str;
                 }
-                
-                // Reset draft with this token and add to input
-                draft.clear();
-                inp.push_back(id);
-                break;
+
+                continue;
             }
-        }
-        
-        // Record acceptance statistics
-        n_accept_list.push_back(std::max(accept_length, 1));
-        
-        // Check if we've generated enough tokens or reached EOS
-        if ((params.n_predict > 0 && n_predict >= params.n_predict) || has_eos) {
+
+            if (write_to_file) {
+                generated_text << token_str;
+            }
+
+
+            LOG_DBG("the sampled target token (%d, '%s') did not match, or we ran out of drafted tokens\n", id, token_str.c_str());
+
+            draft.clear();
+            draft.push_back(id);
+            inp.push_back(id);
+            {
+                // Update context ngram cache with the newly accepted token:
+                const int64_t t_start_draft_us = ggml_time_us();
+                ngram_index_update(nindex, inp, params.ngram_min, params.ngram_max, 1, false);
+                t_draft_us += ggml_time_us() - t_start_draft_us;
+            }
             break;
         }
+        n_accept_list.push_back(std::max(accept_length, 1));
         
-        // Clean the cache of draft tokens that weren't accepted
+        if ((params.n_predict > 0 && n_predict > params.n_predict) || has_eos) {
+            break;
+        }
+
+        // KV cache management
+        // clean the cache of draft tokens that weren't accepted
         llama_kv_self_seq_rm(ctx, 0, n_past, -1);
-        
-        // Reset for next token
-        n_past = inp.size();
+
+        common_batch_clear(batch_tgt);
+        common_batch_add(batch_tgt, draft[0], n_past, { 0 }, true);
+
+        // Draft already contains a single token sampled from the model:
+        GGML_ASSERT(draft.size() == 1);
+        GGML_ASSERT(draft[0] == inp.back());
+        const int64_t t_start_draft_us = ggml_time_us();
+
+        // In main generation loop
+        ngram_index_draft(inp, draft, n_draft, idx_params.ngram_min, idx_params.ngram_max, nindex, index_tokens, idx_params.selection_strategy);    
+        //ngram_index_draft(inp, draft, n_draft, params.ngram_min, params.ngram_max, nindex, 0);
+        // check content of draft if not empty, len of draf
+        if (!draft.empty()) {
+            // Create a string to hold the concatenated tokens
+            std::string draft_content = "";
+            for (size_t i = 0; i < draft.size(); i++) {
+                draft_content += common_token_to_piece(ctx, draft[i]);
+            }
+            LOG_INF("0421 CHECK: draft [len=%zu]: '%s'\n", draft.size(), draft_content.c_str());
+        }
+
+        for (size_t i = 1; i < draft.size(); ++i) {
+            common_batch_add(batch_tgt, draft[i], n_past + i, { 0 }, true);
+        }
+
+        t_draft_us += ggml_time_us() - t_start_draft_us;
+        n_drafted += draft.size() - 1;
+
+        llama_decode(ctx, batch_tgt);
+        ++n_past;
+
+        draft.erase(draft.begin());
     }
     
     auto t_dec_end = ggml_time_us();

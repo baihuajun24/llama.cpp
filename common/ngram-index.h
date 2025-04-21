@@ -144,3 +144,27 @@ void draft_with_ngram_index(
 
 // Print statistics about an n-gram index
 void print_ngram_index_stats(const ngram_index& index);
+
+// Update the ngram index with newly accepted tokens from user input
+// This would be used in a dynamic indexing scenario, or can be a no-op
+// if we're using a static index
+void ngram_index_update(
+    ngram_index& index,
+    const std::vector<llama_token>& tokens,
+    int ngram_min,
+    int ngram_max,
+    int n_tokens = 1,
+    bool reset = false);
+
+// Draft tokens using the ngram index
+// Similar to common_ngram_cache_draft but using our ngram index structure
+// Add this to ngram-index.h
+void ngram_index_draft(
+    const std::vector<llama_token>& inp,
+    std::vector<llama_token>& draft,
+    int n_draft,
+    int ngram_min,
+    int ngram_max,
+    const ngram_index& index,
+    const std::vector<llama_token>& index_tokens,  // Add this parameter
+    int selection_strategy = 0);
