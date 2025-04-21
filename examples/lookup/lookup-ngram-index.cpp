@@ -225,57 +225,23 @@ int main(int argc, char** argv) {
             save_ngram_index(nindex, idx_params.save_index);
         }
 
-        // Replace the sample printing section (around line 230-265) with this:
-        // Print 5 samples of 3-gram patterns
-        LOG_INF("===== 3-gram Pattern Samples =====\n");
-        int samples_printed = 0;
-        for (const auto& pair : nindex) {
-            // Check if this is a 3-gram pattern by its size
-            if (pair.first.size == 3) {
-                // Get the token IDs
-                std::string ids_str = "Token IDs: [";
-                for (int i = 0; i < pair.first.size; i++) {
-                    ids_str += std::to_string(pair.first.tokens[i]);
-                    if (i < pair.first.size - 1) {
-                        ids_str += ", ";
-                    }
-                }
-                ids_str += "]";
-                LOG_INF("%s\n", ids_str.c_str());
-                
-                // Decode the tokens to display as text
-                std::string text_str = "Text: '";
-                for (int i = 0; i < pair.first.size; i++) {
-                    text_str += common_token_to_piece(ctx, pair.first.tokens[i]);
-                }
-                text_str += "'";
-                LOG_INF("%s\n", text_str.c_str());
-                
-                // Show the positions where this n-gram occurs
-                std::string pos_str = "Positions: [";
-                for (size_t i = 0; i < std::min(pair.second.size(), size_t(5)); i++) {
-                    pos_str += std::to_string(pair.second[i]);
-                    if (i < std::min(pair.second.size(), size_t(5)) - 1) {
-                        pos_str += ", ";
-                    }
-                }
-                if (pair.second.size() > 5) {
-                    pos_str += ", ...";
-                }
-                pos_str += "]";
-                LOG_INF("%s\n", pos_str.c_str());
-                
-                LOG_INF("------------------------------\n");
-                
-                samples_printed++;
-                if (samples_printed >= 5) {
-                    break; // Stop after printing 5 samples
-                }
-            }
-        }
 
-        // Tokenize and query the string "for i in" in nindex, print the value retrieved
-        std::vector<llama_token> query_tokens = common_tokenize(ctx, "def has_close_elements", true, true);
+        // Tokenize and query a string in nindex
+        const std::string query_string = "def has_close_elements";
+        // get the token id of first token in query_string
+        llama_token first_token_id = common_tokenize(ctx, query_string, true, true)[1]; // 0 -> <|begin_of_text|>
+        LOG_INF("0421 CHECK: first token id: %d\n", first_token_id);
+        std::vector<llama_token> tokens_with_bos = common_tokenize(ctx, query_string, true, true);
+        std::vector<llama_token> query_tokens(tokens_with_bos.begin() + 1, tokens_with_bos.end());
+        // check length of query_tokens
+        LOG_INF("0421 CHECK: query_tokens size: %zu\n", query_tokens.size());
+        // decode query_tokens to text
+        std::string query_text = "";
+        for (int i = 0; i < query_tokens.size(); i++) {
+            LOG_INF("0421 CHECK: query_text: %s\n", common_token_to_piece(ctx, query_tokens[i]).c_str());
+        }
+        
+        
         if (query_tokens.size() > 0) {
             // Create a key from the tokens
             ngram_index_key key(query_tokens.data(), std::min((int)query_tokens.size(), idx_params.ngram_max), idx_params.ngram_max);
@@ -283,7 +249,7 @@ int main(int argc, char** argv) {
             // Find the key in the index
             auto it = nindex.find(key);
             if (it != nindex.end()) {
-                LOG_INF("0421 CHECK: 'def has_close_elements' found in index\n");
+                LOG_INF("0421 CHECK: '%s' found in index\n", query_string.c_str());
                 
                 // Get the first position
                 if (!it->second.empty()) {
@@ -301,10 +267,80 @@ int main(int argc, char** argv) {
                     LOG_INF("No positions stored for this n-gram\n");
                 }
             } else {
-                LOG_INF("0421 CHECK: 'def has_close_elements' not found in index\n");
+                LOG_INF("0421 CHECK: '%s' not found in index\n", query_string.c_str());
             }
         } else {
-            LOG_INF("0421 CHECK: Failed to tokenize 'def has_close_elements'\n");
+            LOG_INF("0421 CHECK: Failed to tokenize '%s'\n", query_string.c_str());
+        }
+
+        
+        // Print all patterns starting with first_token_id
+        LOG_INF("===== Patterns starting with token %d =====\n", first_token_id);
+        for (const auto& pair : nindex) {
+            // Check if pattern starts with first_token_id
+            if (pair.first.tokens[0] == first_token_id) {
+                // Get the token IDs
+                std::string ids_str = "Token IDs: [";
+                int actual_size = 0;
+                for (int i = 0; i < pair.first.size; i++) {
+                    if (pair.first.tokens[i] != LLAMA_TOKEN_NULL) {
+                        ids_str += std::to_string(pair.first.tokens[i]);
+                        actual_size++;
+                        if (i < pair.first.size-1 && pair.first.tokens[i+1] != LLAMA_TOKEN_NULL) {
+                            ids_str += ", ";
+                        }
+                    }
+                }
+                ids_str += "]";
+                LOG_INF("%s\n", ids_str.c_str());
+                
+                // Decode the pattern tokens to text
+                std::string text_str = "Pattern text: '";
+                for (int i = 0; i < pair.first.size; i++) {
+                    if (pair.first.tokens[i] != LLAMA_TOKEN_NULL) {
+                        text_str += common_token_to_piece(ctx, pair.first.tokens[i]);
+                    }
+                }
+                text_str += "'";
+                LOG_INF("%s\n", text_str.c_str());
+                
+                // Show positions where pattern occurs
+                std::string pos_str = "Positions: [";
+                for (size_t i = 0; i < pair.second.size(); i++) {
+                    pos_str += std::to_string(pair.second[i]);
+                    if (i < pair.second.size() - 1) {
+                        pos_str += ", ";
+                    }
+                }
+                pos_str += "]";
+                LOG_INF("%s\n", pos_str.c_str());
+
+                // For each position, show continuation
+                LOG_INF("Continuations:\n");
+                for (int pos : pair.second) {
+                    // Get 10 tokens after pattern
+                    std::string cont_ids = "  Next token IDs: [";
+                    std::string cont_text = "  Continuation text: '";
+                    
+                    int pattern_len = actual_size;
+                    int end_pos = std::min(pos + pattern_len + 10, (int)index_tokens.size());
+                    
+                    for (int i = pos + pattern_len; i < end_pos; i++) {
+                        cont_ids += std::to_string(index_tokens[i]);
+                        cont_text += common_token_to_piece(ctx, index_tokens[i]);
+                        if (i < end_pos - 1) {
+                            cont_ids += ", ";
+                        }
+                    }
+                    cont_ids += "]";
+                    cont_text += "'";
+                    
+                    LOG_INF("%s\n", cont_ids.c_str());
+                    LOG_INF("%s\n", cont_text.c_str());
+                }
+                
+                LOG_INF("------------------------------\n");
+            }
         }
     }
     
@@ -355,6 +391,9 @@ int main(int argc, char** argv) {
         // Clear previous draft
         draft.clear();
         
+        // Debug log current draft sequence
+        LOG_DBG("drafted %s\n", string_from(ctx, draft).c_str());
+        
         int i_dft = 0;
         int accept_length = 0;
         
@@ -374,6 +413,12 @@ int main(int argc, char** argv) {
         
         // Initialize draft with this token
         draft.push_back(id);
+        inp.push_back(id);
+        
+        // Record first token
+        if (write_to_file) {
+            generated_text << token_str;
+        }
         
         // Draft additional tokens using n-gram index
         if (!nindex.empty()) {
@@ -383,6 +428,7 @@ int main(int argc, char** argv) {
             // Count existing drafted tokens
             int pre_draft_size = draft.size();
             
+            // Draft tokens using n-gram index
             draft_with_ngram_index(
                 inp,
                 draft,
@@ -399,92 +445,89 @@ int main(int argc, char** argv) {
             
             // Track total drafts for statistics
             n_drafted += newly_drafted;
+            
+            // Debug print the drafted sequence
+            LOG_DBG("drafted %s\n", string_from(ctx, draft).c_str());
         }
         
-        // Record first token
-        if (write_to_file) {
-            generated_text << token_str;
-        }
-        
-        // Add first token to input
-        inp.push_back(id);
-        
-        // If we drafted additional tokens, verify them
+        // Must remove first token since it's already been processed and added to input
         if (draft.size() > 1) {
-            // Prepare batch for first token
+            draft.erase(draft.begin());
+        } else {
+            // No tokens were drafted, continue to next iteration
+            n_accept_list.push_back(1); // Record 1 token acceptance
+            
+            // Check if we've generated enough tokens or reached EOS
+            if ((params.n_predict > 0 && n_predict >= params.n_predict) || has_eos) {
+                break;
+            }
+            
+            // Prepare for next token
+            n_past = inp.size();
+            continue;
+        }
+        
+        // Inner verification loop: verify each drafted token
+        while (!draft.empty()) {
+            // Prepare batch for next token
             common_batch_clear(batch_tgt);
             common_batch_add(batch_tgt, draft[0], n_past, { 0 }, true);
             
-            // Decode first token
+            // Decode
             llama_decode(ctx, batch_tgt);
-            n_past++;
             
-            // Reset acceptance counter for this round
-            accept_length = 0;
+            // Sample from model
+            id = common_sampler_sample(smpl, ctx, i_dft);
+            common_sampler_accept(smpl, id, true);
             
-            // Process drafted tokens (starting from index 1)
-            for (size_t i = 1; i < draft.size(); ++i) {
-                // Sample from model
-                id = common_sampler_sample(smpl, ctx, i_dft);
-                common_sampler_accept(smpl, id, true);
+            const std::string drafted_token_str = common_token_to_piece(ctx, id);
+            LOG("%s", drafted_token_str.c_str());
+            
+            ++n_predict;
+            
+            // Check if token matches our drafted token
+            if (id == draft[0]) {
+                // Match! Accept the token
+                LOG_DBG("the sampled target token matches the drafted token (%d, '%s') - accepted\n", 
+                        id, drafted_token_str.c_str());
+                ++n_accept;
+                ++accept_length;
+                ++n_past;
+                ++i_dft;
+                inp.push_back(id);
                 
-                const std::string drafted_token_str = common_token_to_piece(ctx, id);
-                LOG("%s", drafted_token_str.c_str());
-                
-                ++n_predict;
-                
-                // Check if token matches our drafted token
-                if (id == draft[i]) {
-                    // Match! Accept the token
-                    LOG_DBG("the sampled target token matches the drafted token (%d, '%s') - accepted\n", 
-                            id, drafted_token_str.c_str());
-                    ++n_accept;
-                    ++accept_length;
-                    ++n_past;
-                    ++i_dft;
-                    inp.push_back(id);
-                    
-                    if (write_to_file) {
-                        generated_text << drafted_token_str;
-                    }
-                    
-                    // Prepare batch for next token (if any)
-                    if (i + 1 < draft.size()) {
-                        common_batch_clear(batch_tgt);
-                        common_batch_add(batch_tgt, draft[i+1], n_past, { 0 }, true);
-                        llama_decode(ctx, batch_tgt);
-                    }
-                    
-                    // Continue with next drafted token
-                    continue;
-                } else {
-                    // No match, stop drafting
-                    LOG_DBG("the sampled target token (%d, '%s') did not match the drafted token (%d)\n", 
-                            id, drafted_token_str.c_str(), draft[i]);
-                    
-                    if (write_to_file) {
-                        generated_text << drafted_token_str;
-                    }
-                    
-                    // Reset draft with this token
-                    draft.clear();
-                    draft.push_back(id);
-                    inp.push_back(id);
-                    break;
+                if (write_to_file) {
+                    generated_text << drafted_token_str;
                 }
+                
+                // Remove the accepted token from draft
+                draft.erase(draft.begin());
+            } else {
+                // No match, stop drafting
+                LOG_DBG("the sampled target token (%d, '%s') did not match the drafted token (%d, '%s')\n", 
+                        id, drafted_token_str.c_str(), draft[0], common_token_to_piece(ctx, draft[0]).c_str());
+                
+                if (write_to_file) {
+                    generated_text << drafted_token_str;
+                }
+                
+                // Reset draft with this token and add to input
+                draft.clear();
+                inp.push_back(id);
+                break;
             }
-            
-            // Record acceptance statistics
-            n_accept_list.push_back(std::max(accept_length, 1));
-        } else {
-            // No drafting occurred, just record a single acceptance
-            n_accept_list.push_back(1);
         }
+        
+        // Record acceptance statistics
+        n_accept_list.push_back(std::max(accept_length, 1));
         
         // Check if we've generated enough tokens or reached EOS
         if ((params.n_predict > 0 && n_predict >= params.n_predict) || has_eos) {
             break;
         }
+        
+        // Clean the cache of draft tokens that weren't accepted
+        llama_kv_self_seq_rm(ctx, 0, n_past, -1);
         
         // Reset for next token
         n_past = inp.size();
