@@ -27,3 +27,10 @@ add_executable(${TARGET_NGRAM} lookup-ngram.cpp)
 install(TARGETS ${TARGET_NGRAM} RUNTIME)
 target_link_libraries(${TARGET_NGRAM} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET_NGRAM} PRIVATE cxx_std_17)
+
+# Add the new ngram-index executables
+set(TARGET_NGRAM_INDEX llama-lookup-ngram-index)
+add_executable(${TARGET_NGRAM_INDEX} lookup-ngram-index.cpp)
+install(TARGETS ${TARGET_NGRAM_INDEX} RUNTIME)
+target_link_libraries(${TARGET_NGRAM_INDEX} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET_NGRAM_INDEX} PRIVATE cxx_std_17)
