@@ -2410,6 +2410,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DRAFT_MIN"));
     add_opt(common_arg(
+        {"--ngram-min"}, "N",
+        "Minimum n-gram size for lookup cache (default: 1)",
+        [](common_params & params, int value) {
+            params.ngram_min = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_LOOKUP}));
+
+    add_opt(common_arg(
+        {"--ngram-max"}, "N",
+        "Maximum n-gram size for lookup cache (default: 4)",
+        [](common_params & params, int value) {
+            params.ngram_max = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_LOOKUP}));
+        add_opt(common_arg(
         {"--draft-p-split"}, "P",
         string_format("speculative decoding split probability (default: %.1f)", (double)params.speculative.p_split),
         [](common_params & params, const std::string & value) {

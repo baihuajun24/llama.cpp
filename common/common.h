@@ -428,6 +428,10 @@ struct common_params {
 
     // common params
     std::string out_file; // output filename for all example programs
+
+    // 0421 added
+    int ngram_min = 1;  // Default minimum n-gram size
+    int ngram_max = 4;  // Default maximum n-gram size
 };
 
 // call once at the start of a program if it uses libcommon
