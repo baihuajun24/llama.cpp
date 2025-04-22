@@ -34,3 +34,7 @@ add_executable(${TARGET_NGRAM_INDEX} lookup-ngram-index.cpp)
 install(TARGETS ${TARGET_NGRAM_INDEX} RUNTIME)
 target_link_libraries(${TARGET_NGRAM_INDEX} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET_NGRAM_INDEX} PRIVATE cxx_std_17)
+
+# Add the lookup-rest executable
+add_executable(llama-lookup-rest lookup-rest.cpp)
+target_link_libraries(llama-lookup-rest PRIVATE common llama rest_index)

@@ -73,6 +73,8 @@ add_library(${TARGET} STATIC
     ngram-cache.h
     ngram-index.cpp  
     ngram-index.h
+    rest-index.h
+    rest-index.cpp
     sampling.cpp
     sampling.h
     speculative.cpp
@@ -141,3 +143,46 @@ endif ()
 target_include_directories(${TARGET} PUBLIC .)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 target_link_libraries     (${TARGET} PRIVATE ${LLAMA_COMMON_EXTRA_LIBS} PUBLIC llama Threads::Threads)
+
+
+# Add REST support from DraftRetriever
+if (WIN32)
+    # Windows paths for DraftRetriever
+    set(DRAFTRETRIEVER_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../REST/DraftRetriever/target/release")
+    
+    # Check if the library exists in expected location
+    if(EXISTS "${DRAFTRETRIEVER_LIB_DIR}/draftretriever.dll.lib")
+        set(DRAFTRETRIEVER_LIB "${DRAFTRETRIEVER_LIB_DIR}/draftretriever.dll.lib")
+    elseif(EXISTS "${DRAFTRETRIEVER_LIB_DIR}/draftretriever.lib")
+        set(DRAFTRETRIEVER_LIB "${DRAFTRETRIEVER_LIB_DIR}/draftretriever.lib")
+    elseif(EXISTS "${DRAFTRETRIEVER_LIB_DIR}/libdraftretriever.a")
+        set(DRAFTRETRIEVER_LIB "${DRAFTRETRIEVER_LIB_DIR}/libdraftretriever.a")
+    else()
+        message(WARNING "DraftRetriever library not found at ${DRAFTRETRIEVER_LIB_DIR}")
+        set(DRAFTRETRIEVER_LIB "")
+    endif()
+    
+    # Windows-specific dependency libraries
+    set(REST_PLATFORM_LIBS 
+        ws2_32    # Windows Sockets API
+        userenv   # For GetUserProfileDirectoryW
+        bcrypt    # For BCryptGenRandom
+        advapi32  # For registry access
+    )
+else()
+    # Linux/Mac paths for DraftRetriever
+    set(DRAFTRETRIEVER_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../REST/DraftRetriever/target/release")
+    set(DRAFTRETRIEVER_LIB "${DRAFTRETRIEVER_LIB_DIR}/libdraftretriever.a")
+    set(REST_PLATFORM_LIBS dl pthread)
+endif()
+
+# Create rest_index as a separate library
+add_library(rest_index INTERFACE)
+target_link_libraries(rest_index INTERFACE ${TARGET})
+
+# Link with DraftRetriever if found
+if(DRAFTRETRIEVER_LIB)
+    target_link_libraries(rest_index INTERFACE ${DRAFTRETRIEVER_LIB} ${REST_PLATFORM_LIBS})
+    target_compile_definitions(${TARGET} PUBLIC LLAMA_USE_REST)
+    message(STATUS "DraftRetriever library found: ${DRAFTRETRIEVER_LIB}")
+endif()
