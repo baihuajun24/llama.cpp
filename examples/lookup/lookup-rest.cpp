@@ -27,45 +27,8 @@ struct rest_params {
     int choices = 64;
 };
 
-static bool parse_params(int argc, char** argv, common_params& params, rest_params& rest_params) {
-    bool valid_args = true;
-    
-    // Set default values
-    rest_params.max_prefix_len = 6;
-    rest_params.min_prefix_len = 2;
-    rest_params.choices = 64;
-    
-    // Process command line arguments
-    for (int i = 1; i < argc; i++) {
-        std::string arg = argv[i];
-        
-        if (arg == "--load-index" && i + 1 < argc) {
-            rest_params.load_index = argv[++i];
-        } else if (arg == "--max-prefix-len" && i + 1 < argc) {
-            rest_params.max_prefix_len = std::stoi(argv[++i]);
-        } else if (arg == "--min-prefix-len" && i + 1 < argc) {
-            rest_params.min_prefix_len = std::stoi(argv[++i]);
-        } else if (arg == "--choices" && i + 1 < argc) {
-            rest_params.choices = std::stoi(argv[++i]);
-        }
-    }
-    
-    // Validate parameters
-    if (rest_params.load_index.empty()) {
-        LOG_ERR("--load-index must be specified\n");
-        valid_args = false;
-    }
-    
-    if (rest_params.max_prefix_len < rest_params.min_prefix_len) {
-        LOG_ERR("max-prefix-len must be greater than or equal to min-prefix-len\n");
-        valid_args = false;
-    }
-    
-    return valid_args;
-}
-
-static void print_usage() {
-    printf("usage: llama-lookup-rest [options]\n\n");
+void rest_print_usage(int argc, char ** argv) {
+    printf("usage: %s [options]\n\n", argv[0]);
     printf("options:\n");
     printf("  -h, --help                  show this help message and exit\n");
     printf("  -m FNAME, --model FNAME     model path\n");
@@ -96,15 +59,35 @@ int main(int argc, char** argv) {
     common_params params;
     rest_params rparams;
     
-    // Parse common parameters
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_LOOKUP)) {
-        print_usage();
+    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_LOOKUP, rest_print_usage)) {
         return 1;
     }
     
-    // Parse REST specific parameters
-    if (!parse_params(argc, argv, params, rparams)) {
-        print_usage();
+    // Hardcode the index path instead of reading from command line
+    rparams.load_index = "/c/Users/Administrator/Documents/REST/datastore/datastore_stack_small.idx";
+    
+    rparams.max_prefix_len = 6;
+    rparams.min_prefix_len = 2;
+    rparams.choices = 64;
+    
+    // Process command line arguments only for the other parameters
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        
+        if (arg == "--max-prefix-len" && i + 1 < argc) {
+            rparams.max_prefix_len = std::stoi(argv[++i]);
+        } else if (arg == "--min-prefix-len" && i + 1 < argc) {
+            rparams.min_prefix_len = std::stoi(argv[++i]);
+        } else if (arg == "--choices" && i + 1 < argc) {
+            rparams.choices = std::stoi(argv[++i]);
+        }
+    }
+    
+    // No need to validate the load_index path since it's hardcoded
+    
+    if (rparams.max_prefix_len < rparams.min_prefix_len) {
+        LOG_ERR("max-prefix-len must be greater than or equal to min-prefix-len\n");
+        rest_print_usage(argc, argv);
         return 1;
     }
     

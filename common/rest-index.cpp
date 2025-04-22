@@ -2,121 +2,134 @@
 #include "rest-index.h"
 #include "log.h"
 #include <stdexcept>
+#include <Python.h>
+#include <iostream>
 
-RESTIndex::RESTIndex() : reader(nullptr), loaded(false) {
+// Helper function to convert C++ vector to Python list
+PyObject* vectorToList(const std::vector<llama_token>& vec) {
+    PyObject* list = PyList_New(vec.size());
+    for (size_t i = 0; i < vec.size(); i++) {
+        PyList_SET_ITEM(list, i, PyLong_FromLong((long)vec[i]));
+    }
+    return list;
+}
+
+// Helper function to convert Python list to C++ vector
+std::vector<llama_token> listToVector(PyObject* list) {
+    std::vector<llama_token> vec;
+    if (!PyList_Check(list)) return vec;
+    
+    Py_ssize_t size = PyList_Size(list);
+    vec.reserve(size);
+    
+    for (Py_ssize_t i = 0; i < size; i++) {
+        PyObject* item = PyList_GetItem(list, i);
+        vec.push_back((llama_token)PyLong_AsLong(item));
+    }
+    
+    return vec;
+}
+
+RESTIndex::RESTIndex() : py_module(nullptr), loaded(false) {
+    // Initialize Python interpreter if not already running
+    if (!Py_IsInitialized()) {
+        Py_Initialize();
+        PyRun_SimpleString("import sys; sys.path.append('.')"); // Add current directory to path
+    }
+    
+    // Import the bridge module
+    PyObject* moduleName = PyUnicode_FromString("rest_bridge");
+    py_module = PyImport_Import(moduleName);
+    Py_DECREF(moduleName);
+    
+    if (!py_module) {
+        LOG_ERR("Failed to import rest_bridge module. Make sure rest_bridge.py is in your path.\n");
+        PyErr_Print();
+    }
 }
 
 RESTIndex::~RESTIndex() {
-    if (reader) {
-        draftretriever::draftretriever_free_reader(reader);
-        reader = nullptr;
-    }
-    loaded = false;
+    Py_XDECREF(py_module);
 }
 
 bool RESTIndex::buildIndex(const std::vector<llama_token>& tokens, const std::string& indexPath) {
-    // Convert llama_tokens to the format expected by DraftRetriever (int32_t)
-    std::vector<int32_t> convertedTokens;
-    convertedTokens.reserve(tokens.size());
-    
-    for (const auto& token : tokens) {
-        convertedTokens.push_back(static_cast<int32_t>(token));
-    }
-    
-    try {
-        // Use the build_index function from draftretriever
-        int result = draftretriever::draftretriever_build_index(
-            convertedTokens.data(),
-            convertedTokens.size(),
-            indexPath.c_str(),
-            35000 // default vocab size
-        );
-        
-        return result == 0;
-    } catch (const std::exception& e) {
-        LOG_ERR("Error building REST index: %s\n", e.what());
-        return false;
-    }
+    LOG_ERR("Building index is not implemented for Python bridge. Please build index using Python directly.\n");
+    return false;
 }
 
 bool RESTIndex::loadIndex(const std::string& indexPath) {
-    // Clean up any existing reader
-    if (reader) {
-        draftretriever::draftretriever_free_reader(reader);
-        reader = nullptr;
-        loaded = false;
-    }
-    
-    try {
-        // Create a new reader using the C API
-        reader = draftretriever::draftretriever_create_reader(indexPath.c_str());
-        loaded = (reader != nullptr);
-        return loaded;
-    } catch (const std::exception& e) {
-        LOG_ERR("Error loading REST index: %s\n", e.what());
+    if (!py_module) {
+        LOG_ERR("Python bridge module not loaded\n");
         return false;
     }
+    
+    // Get the load_index function
+    PyObject* loadFunc = PyObject_GetAttrString(py_module, "load_index");
+    if (!loadFunc || !PyCallable_Check(loadFunc)) {
+        LOG_ERR("Cannot find function 'load_index' in rest_bridge module\n");
+        Py_XDECREF(loadFunc);
+        return false;
+    }
+    
+    // Call the function with the path
+    PyObject* pathObj = PyUnicode_FromString(indexPath.c_str());
+    PyObject* result = PyObject_CallFunctionObjArgs(loadFunc, pathObj, NULL);
+    Py_DECREF(pathObj);
+    Py_DECREF(loadFunc);
+    
+    if (!result) {
+        LOG_ERR("Error calling load_index function\n");
+        PyErr_Print();
+        return false;
+    }
+    
+    // Check if it returned True
+    loaded = PyObject_IsTrue(result);
+    Py_DECREF(result);
+    
+    LOG_INF("REST index %s loaded: %s\n", indexPath.c_str(), loaded ? "success" : "failed");
+    return loaded;
 }
 
 std::vector<llama_token> RESTIndex::search(const std::vector<llama_token>& prefix, int choices) {
-    if (!loaded || !reader) {
+    if (!py_module || !loaded) {
         return {};
     }
     
-    // Convert llama_tokens to int32_t
-    std::vector<int32_t> convertedPrefix;
-    convertedPrefix.reserve(prefix.size());
-    
-    for (const auto& token : prefix) {
-        convertedPrefix.push_back(static_cast<int32_t>(token));
-    }
-    
-    try {
-        // Prepare the SearchResults struct
-        draftretriever::SearchResults results = {};
-        
-        // Call the search function
-        int ret = draftretriever::draftretriever_search(
-            reader,
-            convertedPrefix.data(),
-            convertedPrefix.size(),
-            choices, // choices
-            5000,    // k - default value from Python code
-            10,      // long_ - default value from Python code
-            &results
-        );
-        
-        if (ret != 0 || results.list_count == 0 || results.token_lists == nullptr) {
-            return {};
-        }
-        
-        // Extract the first list of tokens (first candidate)
-        int32_t *first_list = results.token_lists[0];
-        size_t count = results.token_counts[0];
-        
-        // Convert to llama_token and filter out padding tokens (-2)
-        std::vector<llama_token> result;
-        result.reserve(count);
-        
-        for (size_t i = 0; i < count; i++) {
-            int32_t token = first_list[i];
-            if (token != -2) { // Skip padding tokens
-                result.push_back(static_cast<llama_token>(token));
-            }
-        }
-        
-        // Free the search results
-        draftretriever::draftretriever_free_search_results(&results);
-        
-        return result;
-    } catch (const std::exception& e) {
-        LOG_ERR("Error during REST search: %s\n", e.what());
+    // Get the search function
+    PyObject* searchFunc = PyObject_GetAttrString(py_module, "search");
+    if (!searchFunc || !PyCallable_Check(searchFunc)) {
+        LOG_ERR("Cannot find function 'search' in rest_bridge module\n");
+        Py_XDECREF(searchFunc);
         return {};
     }
+    
+    // Convert prefix to Python list
+    PyObject* prefixList = vectorToList(prefix);
+    
+    // Call the function
+    PyObject* choicesObj = PyLong_FromLong(choices);
+    PyObject* resultObj = PyObject_CallFunctionObjArgs(searchFunc, prefixList, choicesObj, NULL);
+    Py_DECREF(prefixList);
+    Py_DECREF(choicesObj);
+    Py_DECREF(searchFunc);
+    
+    if (!resultObj) {
+        LOG_ERR("Error calling search function\n");
+        PyErr_Print();
+        return {};
+    }
+    
+    // Convert result to vector
+    std::vector<llama_token> result = listToVector(resultObj);
+    Py_DECREF(resultObj);
+    
+    LOG_DBG("REST search found %zu continuation tokens\n", result.size());
+    return result;
 }
 
 bool RESTIndex::isLoaded() const {
-    return loaded && reader != nullptr;
+    return loaded && py_module != nullptr;
 }
 
 void rest_draft(

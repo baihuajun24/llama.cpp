@@ -5,11 +5,14 @@
 #include <vector>
 #include <string>
 #include "llama.h"
-#include "draftretriever.h" // Include the auto-generated header
+
+// Forward declare Python types
+struct _object;
+typedef _object PyObject;
 
 class RESTIndex {
 private:
-    draftretriever::Reader* reader;
+    PyObject* py_module;
     bool loaded;
 
 public:
@@ -20,7 +23,7 @@ public:
     RESTIndex(const RESTIndex&) = delete;
     RESTIndex& operator=(const RESTIndex&) = delete;
     
-    // Create and save an index from tokens
+    // Create and save an index from tokens (not implemented)
     bool buildIndex(const std::vector<llama_token>& tokens, const std::string& indexPath);
     
     // Load an existing index
