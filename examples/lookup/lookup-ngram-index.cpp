@@ -409,7 +409,7 @@ int main(int argc, char** argv) {
 
             // check if the target token matches the draft
             if (i_dft < (int) draft.size() && id == draft[i_dft]) {
-                LOG_INF("the sampled target token matches the %dth drafted token (%d, '%s') - accepted\n", i_dft, id, token_str.c_str());
+                // LOG_INF("the sampled target token matches the %dth drafted token (%d, '%s') - accepted\n", i_dft, id, token_str.c_str());
                 ++n_accept;
                 accept_length += 1;
                 ++n_past;
@@ -475,7 +475,10 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < draft.size(); i++) {
                 draft_content += common_token_to_piece(ctx, draft[i]);
             }
-            LOG_INF("0421 CHECK: draft [len=%zu]: '%s'\n", draft.size(), draft_content.c_str());
+            // only log this if len > 1
+            if (draft.size() > 1) {
+                LOG_INF("0421 CHECK: draft [len=%zu]: '%s'\n", draft.size(), draft_content.c_str());
+            }
         }
 
         for (size_t i = 1; i < draft.size(); ++i) {
