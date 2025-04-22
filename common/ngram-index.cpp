@@ -476,14 +476,7 @@ void ngram_index_draft(
                 draft.push_back(next_token);
             }
             found_continuation = true;
-            
-            // Log the updated draft
-            std::string draft_str = "Draft now: ";
-            for (auto t : draft) {
-                draft_str += std::to_string(t) + " ";
-            }
-            LOG_INF("%s\n", draft_str.c_str());
-            
+                        
             // Break from n-gram size loop since we found a continuation
             break;
         }
