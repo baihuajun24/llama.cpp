@@ -25,74 +25,100 @@ struct rest_params {
     
     // Number of choices to consider
     int choices = 64;
+    
+    // Selection strategy: 0 = first, 1 = random
+    int selection_strategy = 0;
 };
 
-void rest_print_usage(int argc, char ** argv) {
-    printf("usage: %s [options]\n\n", argv[0]);
+static bool parse_params(int argc, char** argv, common_params& params, rest_params& rest_params) {
+    // Similar to ngram_index's parse_params
+    // Set defaults, read environment variables, etc.
+    
+    // Process command line arguments
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        
+        if (arg == "--load-index" && i + 1 < argc) {
+            rest_params.load_index = argv[++i];
+        } else if (arg == "--max-prefix-len" && i + 1 < argc) {
+            rest_params.max_prefix_len = std::stoi(argv[++i]);
+        } else if (arg == "--min-prefix-len" && i + 1 < argc) {
+            rest_params.min_prefix_len = std::stoi(argv[++i]);
+        } else if (arg == "--choices" && i + 1 < argc) {
+            rest_params.choices = std::stoi(argv[++i]);
+        } else if (arg == "--selection-strategy" && i + 1 < argc) {
+            rest_params.selection_strategy = std::stoi(argv[++i]);
+        }
+    }
+    
+    // // Validate parameters
+    // if (rest_params.load_index.empty()) {
+    //     LOG_ERR("--load-index must be specified\n");
+    //     return false;
+    // }
+    
+    if (rest_params.max_prefix_len < rest_params.min_prefix_len) {
+        LOG_ERR("max-prefix-len must be greater than or equal to min-prefix-len\n");
+        return false;
+    }
+    
+    return true;
+}
+
+static void print_usage() {
+    printf("usage: llama-lookup-rest [options]\n\n");
     printf("options:\n");
     printf("  -h, --help                  show this help message and exit\n");
     printf("  -m FNAME, --model FNAME     model path\n");
-    printf("  --load-index FNAME          load index from this file\n");
+    printf("  -f FNAME, --file FNAME      prompt file path\n");
+    printf("  -n N, --n-predict N         number of tokens to predict\n");
+    printf("  -t N, --threads N           number of threads\n");
+    printf("  --load-index FNAME          load REST index from this file\n");
     printf("  --max-prefix-len N          maximum prefix length to consider (default: 6)\n");
     printf("  --min-prefix-len N          minimum prefix length to consider (default: 2)\n");
     printf("  --choices N                 number of choices to consider (default: 64)\n");
-}
-
-void print_token_info(llama_context* ctx, const std::vector<llama_token>& tokens) {
-    LOG_INF("Token IDs: [");
-    for (size_t i = 0; i < tokens.size(); i++) {
-        LOG_INF("%d", tokens[i]);
-        if (i < tokens.size() - 1) {
-            LOG_INF(", ");
-        }
-    }
-    LOG_INF("]\n");
-    
-    LOG_INF("Token text: '");
-    for (const auto& token : tokens) {
-        LOG_INF("%s", common_token_to_piece(ctx, token).c_str());
-    }
-    LOG_INF("'\n");
+    printf("  --selection-strategy N      strategy for selecting continuations (0=first, 1=random)\n");
+    printf("  --draft N                   number of tokens to draft (default: 5)\n");
+    printf("  -o FNAME, --output FNAME    output file for generated text\n");
 }
 
 int main(int argc, char** argv) {
     common_params params;
     rest_params rparams;
     
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_LOOKUP, rest_print_usage)) {
+    // Parse parameters
+    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_LOOKUP)) {
+        print_usage();
         return 1;
     }
     
-    // Hardcode the index path instead of reading from command line
-    // rparams.load_index = "/c/Users/Administrator/Documents/REST/datastore/datastore_stack_small.idx";
+    if (!parse_params(argc, argv, params, rparams)) {
+        print_usage();
+        return 1;
+    }
+
+    // Hardcode for testing
     rparams.load_index = "C:\\Users\\Administrator\\Documents\\REST\\datastore\\datastore_stack_small.idx";
 
     rparams.max_prefix_len = 6;
     rparams.min_prefix_len = 2;
     rparams.choices = 64;
     
-    // Process command line arguments only for the other parameters
-    for (int i = 1; i < argc; i++) {
-        std::string arg = argv[i];
-        
-        if (arg == "--max-prefix-len" && i + 1 < argc) {
-            rparams.max_prefix_len = std::stoi(argv[++i]);
-        } else if (arg == "--min-prefix-len" && i + 1 < argc) {
-            rparams.min_prefix_len = std::stoi(argv[++i]);
-        } else if (arg == "--choices" && i + 1 < argc) {
-            rparams.choices = std::stoi(argv[++i]);
-        }
-    }
-    
-    // No need to validate the load_index path since it's hardcoded
-    
-    if (rparams.max_prefix_len < rparams.min_prefix_len) {
-        LOG_ERR("max-prefix-len must be greater than or equal to min-prefix-len\n");
-        rest_print_usage(argc, argv);
-        return 1;
-    }
+    // From here on, follow the structure of lookup-ngram-index.cpp's main function:
+    // 1. Initialize common components
+    // 2. Load the model
+    // 3. Load the REST index
+    // 4. Process the prompt and generate text
+    // 5. Track performance metrics and output the results
     
     common_init();
+    
+    // For storing generated text
+    std::stringstream generated_text;
+    bool write_to_file = !params.out_file.empty();
+    
+    // Max number of tokens to draft
+    const int n_draft = params.speculative.n_max;
     
     // Initialize llama.cpp
     llama_backend_init();
@@ -101,13 +127,14 @@ int main(int argc, char** argv) {
     // Load the model
     common_init_result llama_init = common_init_from_params(params);
     
-    if (!llama_init.model) {
-        LOG_ERR("Failed to load model\n");
-        return 1;
-    }
-    
     llama_model* model = llama_init.model.get();
     llama_context* ctx = llama_init.context.get();
+    
+    const llama_vocab* vocab = llama_model_get_vocab(model);
+    
+    // Tokenize prompt
+    std::vector<llama_token> inp;
+    inp = common_tokenize(ctx, params.prompt, true, true);
     
     // Initialize REST index
     RESTIndex rest_index;
@@ -119,82 +146,199 @@ int main(int argc, char** argv) {
     
     LOG_INF("Successfully loaded REST index from %s\n", rparams.load_index.c_str());
     
-    // Test string "for i in"
-    const std::string test_string = "import pandas as";
+    // Check context limits
+    const int max_context_size = llama_n_ctx(ctx);
+    const int max_tokens_list_size = max_context_size - 4;
     
-    // Tokenize the test string
-    std::vector<llama_token> test_tokens = common_tokenize(ctx, test_string, true, false);
-    test_tokens = std::vector<llama_token>(test_tokens.begin() + 1, test_tokens.end()); // Remove <s> token
+    if ((int)inp.size() > max_tokens_list_size) {
+        LOG_ERR("%s: prompt too long (%d tokens, max %d)\n", __func__, (int)inp.size(), max_tokens_list_size);
+        return 1;
+    }
     
-    LOG_INF("==========================================================\n");
-    LOG_INF("Testing REST index with string: '%s'\n", test_string.c_str());
-    LOG_INF("Tokenized as:\n");
-    print_token_info(ctx, test_tokens);
-    LOG_INF("==========================================================\n");
+    // Print prompt
+    LOG("\n\n");
+    for (auto id : inp) {
+        LOG("%s", common_token_to_piece(ctx, id).c_str());
+    }
+    fflush(stderr);
     
-    // Try different prefix lengths
-    for (int prefix_len = std::min(rparams.max_prefix_len, (int)test_tokens.size()); 
-         prefix_len >= rparams.min_prefix_len; --prefix_len) {
-        
-        // Extract the prefix
-        std::vector<llama_token> prefix(test_tokens.end() - prefix_len, test_tokens.end());
-        
-        LOG_DBG("Trying REST search with prefix length %d\n", prefix_len);
-        
-        // Search for candidate continuations
-        std::vector<RESTCandidate> candidates = rest_index.searchCandidates(prefix, rparams.choices);
-        
-        // Print the candidates for debugging
-        rest_index.printCandidates(candidates, ctx, 3, 20);
-        
-        // Get the first candidate for continuation (maintaining original behavior)
-        std::vector<llama_token> continuations;
-        if (!candidates.empty()) {
-            continuations = candidates[0].tokens;
-        }
-        
-        if (!continuations.empty()) {
-            LOG_INF("Found %zu continuation tokens:\n", continuations.size());
-            
-            // Create a draft with the last token of the prefix
-            std::vector<llama_token> draft = { prefix.back() };
-            
-            // Add continuations
-            for (const auto& token : continuations) {
-                draft.push_back(token);
+    const int n_input = inp.size();
+    
+    // Track performance metrics
+    const auto t_enc_start = ggml_time_us();
+    
+    int64_t t_draft_us = 0;
+    // Encode prompt
+    llama_decode(ctx, llama_batch_get_one(inp.data(), n_input - 1));
+    llama_decode(ctx, llama_batch_get_one(&inp.back(), 1));
+    
+    const auto t_enc_end = ggml_time_us();
+    
+    // Generation variables
+    int n_predict = 0;
+    int n_drafted = 0;
+    int n_accept = 0;
+    std::vector<int> n_accept_list;
+    
+    int n_past = inp.size();
+    bool has_eos = false;
+    
+    struct common_sampler* smpl = common_sampler_init(model, params.sampling);
+    std::vector<llama_token> draft;
+    llama_batch batch_tgt = llama_batch_init(params.n_ctx, 0, 1);
+    
+    const auto t_dec_start = ggml_time_us();
+    
+    while (true) {
+        int i_dft = 0;
+        int accept_length = 0;
+        int debug_count = 0; // for test
+        while (debug_count < 1000) {
+            debug_count++;
+            // sample from the target model
+            llama_token id = common_sampler_sample(smpl, ctx, i_dft);
+
+            common_sampler_accept(smpl, id, true);
+
+            const std::string token_str = common_token_to_piece(ctx, id);
+
+            if (llama_vocab_is_eog(vocab, id)) {
+                has_eos = true;
             }
-            
-            // Print draft
-            LOG_INF("Draft (with context token):\n");
-            print_token_info(ctx, draft);
-            
-            // Also print just the continuations
-            LOG_INF("Continuations only:\n");
-            print_token_info(ctx, continuations);
-            
+
+            ++n_predict;
+
+            // check if the target token matches the draft
+            if (i_dft < (int) draft.size() && id == draft[i_dft]) {
+                ++n_accept;
+                accept_length += 1;
+                ++n_past;
+                ++i_dft;
+                inp.push_back(id);
+
+                if (write_to_file) {
+                    generated_text << token_str;
+                }
+
+                continue;
+            }
+
+            if (write_to_file) {
+                generated_text << token_str;
+            }
+
+            LOG_DBG("the sampled target token (%d, '%s') did not match, or we ran out of drafted tokens\n", id, token_str.c_str());
+
+            draft.clear();
+            draft.push_back(id);
+            inp.push_back(id);
             break;
+        }
+        n_accept_list.push_back(std::max(accept_length, 1));
+        
+        if ((params.n_predict > 0 && n_predict > params.n_predict) || has_eos) {
+            break;
+        }
+
+        // KV cache management
+        // clean the cache of draft tokens that weren't accepted
+        llama_kv_self_seq_rm(ctx, 0, n_past, -1);
+
+        common_batch_clear(batch_tgt);
+        common_batch_add(batch_tgt, draft[0], n_past, { 0 }, true);
+
+        // Draft already contains a single token sampled from the model:
+        GGML_ASSERT(draft.size() == 1);
+        GGML_ASSERT(draft[0] == inp.back());
+        const int64_t t_start_draft_us = ggml_time_us();
+
+        // HERE IS THE KEY CHANGE: Call rest_draft instead of ngram_index_draft
+        rest_draft(inp, draft, n_draft, rest_index, rparams.max_prefix_len, rparams.min_prefix_len);
+        
+        // Log draft information
+        if (!draft.empty()) {
+            std::string draft_content = "";
+            for (size_t i = 0; i < draft.size(); i++) {
+                draft_content += common_token_to_piece(ctx, draft[i]);
+            }
+            if (draft.size() > 1) {
+                LOG_INF("REST draft [len=%zu]: '%s'\n", draft.size(), draft_content.c_str());
+            }
+        }
+
+        for (size_t i = 1; i < draft.size(); ++i) {
+            common_batch_add(batch_tgt, draft[i], n_past + i, { 0 }, true);
+        }
+
+        t_draft_us += ggml_time_us() - t_start_draft_us;
+        n_drafted += draft.size() - 1;
+
+        llama_decode(ctx, batch_tgt);
+        ++n_past;
+
+        draft.erase(draft.begin());
+    }
+    
+    auto t_dec_end = ggml_time_us();
+    
+    LOG("\n\n");
+    
+    // Print performance statistics
+    LOG_INF("encoded %4d tokens in %8.3f seconds, speed: %8.3f t/s\n", 
+            n_input, (t_enc_end - t_enc_start) / 1e6f, inp.size() / ((t_enc_end - t_enc_start) / 1e6f));
+    LOG_INF("decoded %4d tokens in %8.3f seconds, speed: %8.3f t/s\n", 
+            n_predict, (t_dec_end - t_dec_start) / 1e6f, n_predict / ((t_dec_end - t_dec_start) / 1e6f));
+    
+    // Calculate accept length average and print statistics
+    float sum = 0;
+    for (size_t i = 0; i < n_accept_list.size(); i++) {
+        sum += n_accept_list[i];
+    }
+    float average = n_accept_list.empty() ? 0 : sum / n_accept_list.size();
+    
+    // Format the vector as a string
+    std::string accept_list_str = "[";
+    for (size_t i = 0; i < n_accept_list.size(); i++) {
+        accept_list_str += std::to_string(n_accept_list[i]);
+        if (i < n_accept_list.size() - 1) {
+            accept_list_str += ", ";
+        }
+    }
+    accept_list_str += "]";
+    
+    LOG_INF("Accept lengths: %s\n", accept_list_str.c_str());
+    LOG_INF("Average accept length: %.2f\n", average);
+    LOG_INF("Total drafted tokens: %d\n", n_drafted);
+    LOG_INF("Total accepted tokens: %d\n", n_accept);
+    if (n_drafted > 0) {
+        LOG_INF("Accept rate: %.2f%%\n", 100.0f * n_accept / n_drafted);
+    }
+    
+    // Write to file if requested
+    if (write_to_file) {
+        std::ofstream output_file(params.out_file);
+        if (!output_file.is_open()) {
+            LOG_ERR("Failed to open output file: %s\n", params.out_file.c_str());
         } else {
-            LOG_INF("No continuations found with this prefix length\n");
+            // First write the statistics as header lines
+            output_file << "# Tokens: " << n_predict << ", Speed: " 
+                      << (n_predict / ((t_dec_end - t_dec_start) / 1e6f)) << " t/s\n";
+            output_file << "# Accept length average: " << average << "\n";
+            output_file << "# Accept lengths: " << accept_list_str << "\n";
+            output_file << "# REST parameters: min_prefix=" << rparams.min_prefix_len 
+                      << ", max_prefix=" << rparams.max_prefix_len << "\n";
+            
+            // Then write the generated text
+            output_file << generated_text.str();
+            output_file.close();
+            
+            LOG_INF("Generated text written to: %s\n", params.out_file.c_str());
         }
     }
     
-    // Test the rest_draft function
-    std::vector<llama_token> input_tokens = test_tokens;
-    std::vector<llama_token> draft = { test_tokens.back() };
-    
-    LOG_INF("\n==========================================================\n");
-    LOG_INF("Testing rest_draft function:\n");
-    LOG_INF("Input: ");
-    print_token_info(ctx, input_tokens);
-    LOG_INF("Initial draft: ");
-    print_token_info(ctx, draft);
-    
-    rest_draft(input_tokens, draft, 10, rest_index, rparams.max_prefix_len, rparams.min_prefix_len);
-    
-    LOG_INF("Result draft: ");
-    print_token_info(ctx, draft);
-    LOG_INF("==========================================================\n");
-    
+    // Clean up
+    common_sampler_free(smpl);
+    llama_batch_free(batch_tgt);
     llama_backend_free();
     
     return 0;
