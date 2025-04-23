@@ -136,14 +136,22 @@ int main(int argc, char** argv) {
     for (int prefix_len = std::min(rparams.max_prefix_len, (int)test_tokens.size()); 
          prefix_len >= rparams.min_prefix_len; --prefix_len) {
         
-        // Extract prefix
+        // Extract the prefix
         std::vector<llama_token> prefix(test_tokens.end() - prefix_len, test_tokens.end());
         
-        LOG_INF("\nTrying with prefix length %d:\n", prefix_len);
-        print_token_info(ctx, prefix);
+        LOG_DBG("Trying REST search with prefix length %d\n", prefix_len);
         
-        // Search for continuations
-        std::vector<llama_token> continuations = rest_index.search(prefix, rparams.choices);
+        // Search for candidate continuations
+        std::vector<RESTCandidate> candidates = rest_index.searchCandidates(prefix, rparams.choices);
+        
+        // Print the candidates for debugging
+        rest_index.printCandidates(candidates, ctx, 3, 20);
+        
+        // Get the first candidate for continuation (maintaining original behavior)
+        std::vector<llama_token> continuations;
+        if (!candidates.empty()) {
+            continuations = candidates[0].tokens;
+        }
         
         if (!continuations.empty()) {
             LOG_INF("Found %zu continuation tokens:\n", continuations.size());

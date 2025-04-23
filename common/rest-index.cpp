@@ -3,6 +3,7 @@
 #include "log.h"
 #include <stdexcept>
 #include <iostream>
+#include "common.h"
 
 RESTIndex::RESTIndex() : reader(nullptr), loaded(false) {
     // Initialize with nullptr
@@ -34,10 +35,12 @@ bool RESTIndex::loadIndex(const std::string& indexPath) {
     }
 }
 
-std::vector<llama_token> RESTIndex::search(const std::vector<llama_token>& prefix, int choices) {
+std::vector<RESTCandidate> RESTIndex::searchCandidates(const std::vector<llama_token>& prefix, int choices) {
+    std::vector<RESTCandidate> candidates;
+    
     if (!loaded || !reader) {
         LOG_ERR("REST index not loaded or reader is null\n");
-        return {};
+        return candidates;
     }
     
     try {
@@ -47,36 +50,81 @@ std::vector<llama_token> RESTIndex::search(const std::vector<llama_token>& prefi
         
         LOG_INF("Searching with prefix of length %zu\n", prefix.size());
         
-        // Call the search function with default parameters for k and length
-        // k = 5000, length = 10 (these are default values from the header)
-        auto paths = (*reader)->search(slice_prefix, 64);
-        
-        // Process results - extract tokens from paths
-        std::vector<llama_token> tokens;
+        // Call the search function with requested number of choices
+        auto paths = (*reader)->search(slice_prefix, choices);
         
         LOG_INF("Found %zu paths\n", paths.size());
         
-        // If we found any paths
-        if (!paths.empty()) {
-            // Get the first path
-            const auto& first_path = paths[0];
-            
-            LOG_INF("First path has %zu tokens\n", first_path.path.size());
+        // Process each path into a candidate
+        for (const auto& path : paths) {
+            RESTCandidate candidate;
             
             // Extract tokens from the path, filtering out padding tokens (-2)
-            for (const auto& token : first_path.path) {
+            for (const auto& token : path.path) {
                 if (token != -2) { // Skip padding tokens
-                    tokens.push_back(static_cast<llama_token>(token));
+                    candidate.tokens.push_back(static_cast<llama_token>(token));
                 }
             }
             
-            LOG_INF("After filtering padding, found %zu tokens\n", tokens.size());
+            // Only add candidates that have tokens
+            if (!candidate.tokens.empty()) {
+                candidates.push_back(candidate);
+            }
         }
         
-        return tokens;
+        LOG_INF("Processed %zu valid candidates\n", candidates.size());
+        
+        return candidates;
     } catch (const std::exception& e) {
-        LOG_ERR("Error in REST search: %s\n", e.what());
-        return {};
+        LOG_ERR("Error in REST search candidates: %s\n", e.what());
+        return candidates;
+    }
+}
+
+std::vector<llama_token> RESTIndex::search(const std::vector<llama_token>& prefix, int choices) {
+    // Use the new searchCandidates method and return the first candidate's tokens
+    std::vector<RESTCandidate> candidates = searchCandidates(prefix, choices);
+    
+    if (!candidates.empty()) {
+        LOG_INF("Returning first candidate with %zu tokens\n", candidates[0].tokens.size());
+        return candidates[0].tokens;
+    }
+    
+    return {};
+}
+
+void RESTIndex::printCandidates(const std::vector<RESTCandidate>& candidates, 
+                               llama_context* ctx, int max_candidates, int max_tokens) {
+    if (candidates.empty()) {
+        LOG_INF("No candidates to print\n");
+        return;
+    }
+    
+    int num_to_print = std::min((int)candidates.size(), max_candidates);
+    LOG_INF("Printing %d out of %zu candidates:\n", num_to_print, candidates.size());
+    
+    for (int i = 0; i < num_to_print; i++) {
+        const auto& candidate = candidates[i];
+        LOG_INF("Candidate %d (%zu tokens):\n", i+1, candidate.tokens.size());
+        
+        // Print tokens in batches for readability
+        int tokens_to_print = std::min((int)candidate.tokens.size(), max_tokens);
+        
+        for (int j = 0; j < tokens_to_print; j++) {
+            if (ctx != nullptr) {
+                // Use common_token_to_piece instead of llama_token_to_piece
+                std::string token_str = common_token_to_piece(ctx, candidate.tokens[j]);
+                LOG_INF("  Token %d: %d, '%s'\n", j, candidate.tokens[j], token_str.c_str());
+            } else {
+                // Without context, just print the token IDs
+                LOG_INF("  Token %d: %d\n", j, candidate.tokens[j]);
+            }
+        }
+        
+        if ((int)candidate.tokens.size() > max_tokens) {
+            LOG_INF("  ... (truncated %zu more tokens)\n", candidate.tokens.size() - max_tokens);
+        }
+        LOG_INF("\n");
     }
 }
 

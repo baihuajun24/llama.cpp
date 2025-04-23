@@ -79,6 +79,8 @@ add_library(${TARGET} STATIC
     sampling.h
     speculative.cpp
     speculative.h
+    draftretriever/draftretriever.cc
+    draftretriever/draftretriever.h
     )
 
 if (BUILD_SHARED_LIBS)
@@ -144,13 +146,23 @@ target_include_directories(${TARGET} PUBLIC .)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 target_link_libraries     (${TARGET} PRIVATE ${LLAMA_COMMON_EXTRA_LIBS} PUBLIC llama Threads::Threads)
 
-# Create rest_index as a separate library
+# Define DraftRetriever library paths - point to the bin directory
+set(DRAFTRETRIEVER_DIR "${CMAKE_BINARY_DIR}/bin")
+set(DRAFTRETRIEVER_CXX_LIB "${DRAFTRETRIEVER_DIR}/cxxbridge1.lib")
+set(DRAFTRETRIEVER_LIB "${DRAFTRETRIEVER_DIR}/draftretriever.dll.lib")
+
+# Add them as imported libraries
+add_library(draftretriever_cxx STATIC IMPORTED)
+set_target_properties(draftretriever_cxx PROPERTIES 
+    IMPORTED_LOCATION "${DRAFTRETRIEVER_CXX_LIB}"
+)
+
+add_library(draftretriever_lib SHARED IMPORTED)
+set_target_properties(draftretriever_lib PROPERTIES 
+    IMPORTED_IMPLIB "${DRAFTRETRIEVER_LIB}"
+    IMPORTED_LOCATION "${DRAFTRETRIEVER_DIR}/draftretriever.dll"
+)
+
+# Then update the rest_index library definition
 add_library(rest_index INTERFACE)
-target_link_libraries(rest_index INTERFACE ${TARGET})
-
-# Find Python packages
-find_package(Python3 COMPONENTS Development REQUIRED)
-include_directories(${Python3_INCLUDE_DIRS})
-
-# Modify the rest_index library to link with Python
-target_link_libraries(rest_index INTERFACE ${TARGET} ${Python3_LIBRARIES})
+target_link_libraries(rest_index INTERFACE ${TARGET} draftretriever_cxx draftretriever_lib)

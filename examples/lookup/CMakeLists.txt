@@ -36,5 +36,33 @@ target_link_libraries(${TARGET_NGRAM_INDEX} PRIVATE common llama ${CMAKE_THREAD_
 target_compile_features(${TARGET_NGRAM_INDEX} PRIVATE cxx_std_17)
 
 # Add the lookup-rest executable
-add_executable(llama-lookup-rest lookup-rest.cpp)
-target_link_libraries(llama-lookup-rest PRIVATE common llama rest_index)
+set(TARGET_REST llama-lookup-rest)
+add_executable(${TARGET_REST} lookup-rest.cpp)
+install(TARGETS ${TARGET_REST} RUNTIME)
+
+# Define DraftRetriever library paths - point to the bin directory where you copied the files
+set(DRAFTRETRIEVER_DIR "${CMAKE_BINARY_DIR}/bin")
+set(DRAFTRETRIEVER_CXX_LIB "${DRAFTRETRIEVER_DIR}/cxxbridge1.lib")
+set(DRAFTRETRIEVER_LIB "${DRAFTRETRIEVER_DIR}/draftretriever.dll.lib")
+
+# Add them as imported libraries with absolute paths
+add_library(draftretriever_cxx STATIC IMPORTED)
+set_target_properties(draftretriever_cxx PROPERTIES 
+    IMPORTED_LOCATION "${DRAFTRETRIEVER_CXX_LIB}"
+)
+
+add_library(draftretriever_lib SHARED IMPORTED)
+set_target_properties(draftretriever_lib PROPERTIES 
+    IMPORTED_IMPLIB "${DRAFTRETRIEVER_LIB}"
+    IMPORTED_LOCATION "${DRAFTRETRIEVER_DIR}/draftretriever.dll"
+)
+
+# Link everything together
+target_link_libraries(${TARGET_REST} PRIVATE 
+    common 
+    llama 
+    rest_index
+    draftretriever_cxx
+    draftretriever_lib
+)
+target_compile_features(${TARGET_REST} PRIVATE cxx_std_17)

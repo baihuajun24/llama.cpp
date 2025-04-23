@@ -11,6 +11,12 @@
 struct _object;
 typedef _object PyObject;
 
+// Define a structure to hold a candidate sequence
+struct RESTCandidate {
+    std::vector<llama_token> tokens;
+    // Could add score or other metadata here if needed
+};
+
 class RESTIndex {
 private:
     // Change from rust::Box<Reader> to a pointer
@@ -31,11 +37,18 @@ public:
     // Load an existing index
     bool loadIndex(const std::string& indexPath);
     
-    // Search for continuations given a prefix
+    // Search for continuations given a prefix - return multiple candidates
+    std::vector<RESTCandidate> searchCandidates(const std::vector<llama_token>& prefix, int choices = 64);
+    
+    // Original search that returns a single vector (for backward compatibility)
     std::vector<llama_token> search(const std::vector<llama_token>& prefix, int choices = 64);
     
     // Check if an index is loaded
     bool isLoaded() const;
+    
+    // Helper to print token information for candidates
+    void printCandidates(const std::vector<RESTCandidate>& candidates, 
+                         llama_context* ctx, int max_candidates = 3, int max_tokens = 20);
 };
 
 // Function to draft tokens using REST approach
