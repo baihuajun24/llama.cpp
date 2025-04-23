@@ -5,6 +5,7 @@
 #include <vector>
 #include <string>
 #include "llama.h"
+#include "draftretriever/draftretriever.h" // Include the DraftRetriever header
 
 // Forward declare Python types
 struct _object;
@@ -12,7 +13,8 @@ typedef _object PyObject;
 
 class RESTIndex {
 private:
-    PyObject* py_module;
+    // Change from rust::Box<Reader> to a pointer
+    rust::Box<Reader>* reader;
     bool loaded;
 
 public:

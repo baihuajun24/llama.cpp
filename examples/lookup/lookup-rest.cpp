@@ -64,8 +64,9 @@ int main(int argc, char** argv) {
     }
     
     // Hardcode the index path instead of reading from command line
-    rparams.load_index = "/c/Users/Administrator/Documents/REST/datastore/datastore_stack_small.idx";
-    
+    // rparams.load_index = "/c/Users/Administrator/Documents/REST/datastore/datastore_stack_small.idx";
+    rparams.load_index = "C:\\Users\\Administrator\\Documents\\REST\\datastore\\datastore_stack_small.idx";
+
     rparams.max_prefix_len = 6;
     rparams.min_prefix_len = 2;
     rparams.choices = 64;
@@ -119,10 +120,11 @@ int main(int argc, char** argv) {
     LOG_INF("Successfully loaded REST index from %s\n", rparams.load_index.c_str());
     
     // Test string "for i in"
-    const std::string test_string = "for i in";
+    const std::string test_string = "import pandas as";
     
     // Tokenize the test string
     std::vector<llama_token> test_tokens = common_tokenize(ctx, test_string, true, false);
+    test_tokens = std::vector<llama_token>(test_tokens.begin() + 1, test_tokens.end()); // Remove <s> token
     
     LOG_INF("==========================================================\n");
     LOG_INF("Testing REST index with string: '%s'\n", test_string.c_str());
