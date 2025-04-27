@@ -131,7 +131,7 @@ int main(int argc, char ** argv){
         LOG_DBG("drafted %s\n", string_from(ctx, draft).c_str());
 
         int i_dft = 0;
-        int accept_length = 0;
+        int accept_length = 1;
         while (true) {
             // sample from the target model
             llama_token id = common_sampler_sample(smpl, ctx, i_dft);
@@ -152,7 +152,8 @@ int main(int argc, char ** argv){
 
             // check if the target token matches the draft
             if (i_dft < (int) draft.size() && id == draft[i_dft]) {
-                LOG_DBG("the sampled target token matches the %dth drafted token (%d, '%s') - accepted\n", i_dft, id, token_str.c_str());
+                //LOG_DBG("the sampled target token matches the %dth drafted token (%d, '%s') - accepted\n", i_dft, id, token_str.c_str());
+
                 ++n_accept;
                 accept_length += 1;
                 ++n_past;
@@ -190,7 +191,7 @@ int main(int argc, char ** argv){
             }
             break;
         }
-        n_accept_list.push_back(std::max(accept_length, 1));
+        n_accept_list.push_back(accept_length);
         
         if ((params.n_predict > 0 && n_predict > params.n_predict) || has_eos) {
             break;
@@ -209,7 +210,25 @@ int main(int argc, char ** argv){
         const int64_t t_start_draft_us = ggml_time_us();
 
         common_ngram_cache_draft(inp, draft, n_draft, params.ngram_min, params.ngram_max, ngram_cache_context, ngram_cache_dynamic, ngram_cache_static);
-
+        // LOG_INF to check last ngram_max tokens of inp and first ngram_max tokens of draft
+        // {
+        //     // Create a vector of the last ngram_max tokens from inp
+        //     std::vector<llama_token> last_inp_tokens;
+        //     size_t start_idx = (inp.size() >= params.ngram_max) ? (inp.size() - params.ngram_max) : 0;
+        //     last_inp_tokens.insert(last_inp_tokens.end(), inp.begin() + start_idx, inp.end());
+        //     LOG_INF("0427 Check: last %d tokens of inp: %s\n", 
+        //            (int)last_inp_tokens.size(),
+        //            string_from(ctx, last_inp_tokens).c_str());
+            
+        //     // Create a vector of the first ngram_max tokens from draft
+        //     std::vector<llama_token> first_draft_tokens;
+        //     size_t end_idx = std::min(draft.size(), (size_t)params.ngram_max);
+        //     first_draft_tokens.insert(first_draft_tokens.end(), draft.begin(), draft.begin() + end_idx);
+        //     LOG_INF("0427 Check: first %d tokens of draft: %s\n", 
+        //            (int)first_draft_tokens.size(),
+        //            string_from(ctx, first_draft_tokens).c_str());
+        // }
+        
         for (size_t i = 1; i < draft.size(); ++i) {
             common_batch_add(batch_tgt, draft[i], n_past + i, { 0 }, true);
         }

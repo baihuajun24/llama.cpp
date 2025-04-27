@@ -191,7 +191,7 @@ int main(int argc, char** argv) {
     
     while (true) {
         int i_dft = 0;
-        int accept_length = 0;
+        int accept_length = 1;
         int debug_count = 0; // for test
         while (debug_count < 1000) {
             debug_count++;
@@ -234,7 +234,7 @@ int main(int argc, char** argv) {
             inp.push_back(id);
             break;
         }
-        n_accept_list.push_back(std::max(accept_length, 1));
+        n_accept_list.push_back(accept_length);
         
         if ((params.n_predict > 0 && n_predict > params.n_predict) || has_eos) {
             break;
