@@ -68,6 +68,7 @@ int main(int argc, char ** argv){
         if (!params.lookup_cache_dynamic.empty()) {
             try {
                 ngram_cache_dynamic = common_ngram_cache_load(params.lookup_cache_dynamic);
+                LOG_INF("0428 Check: loaded ngram_cache from this file: %s\n", params.lookup_cache_dynamic.c_str());
             } catch (std::ifstream::failure const &) {} // if the file does not exist it will simply be created at the end of the program
         }
 
@@ -120,6 +121,9 @@ int main(int argc, char ** argv){
 
     const auto t_dec_start = ggml_time_us();
 
+    // a new counter for no drafted forward times
+    int n_no_draft_forward = 0;
+
     while (true) {
         // debug
         if (dump_kv_cache) {
@@ -128,7 +132,7 @@ int main(int argc, char ** argv){
         }
 
         // print current draft sequence
-        LOG_DBG("drafted %s\n", string_from(ctx, draft).c_str());
+        // LOG_DBG("drafted %s\n", string_from(ctx, draft).c_str());
 
         int i_dft = 0;
         int accept_length = 1;
@@ -149,7 +153,8 @@ int main(int argc, char ** argv){
             }
 
             ++n_predict;
-
+            // use LOG_INF to check the target token and the draft
+            // LOG_INF("0428 Check: target string = %s, draft = %s\n", token_str.c_str(), common_token_to_piece(ctx, draft[i_dft]).c_str());
             // check if the target token matches the draft
             if (i_dft < (int) draft.size() && id == draft[i_dft]) {
                 //LOG_DBG("the sampled target token matches the %dth drafted token (%d, '%s') - accepted\n", i_dft, id, token_str.c_str());
@@ -172,13 +177,22 @@ int main(int argc, char ** argv){
 
                 continue;
             }
+            else {
+                if ((int) draft.size() == 0) {
+                    n_no_draft_forward += 1;
+                    LOG_INF("[0428 Check] no draft caused accept length = %d\n", accept_length);
+                }
+                else{
+                    // LOG_INF("[0428 Check] draft not matched. should be %d, but is %d. caused accept length = %d\n", id, draft[i_dft], accept_length);
+                }
+            }
 
             if (write_to_file) {
                 generated_text << token_str;
             }
 
 
-            LOG_DBG("the sampled target token (%d, '%s') did not match, or we ran out of drafted tokens\n", id, token_str.c_str());
+            // LOG_DBG("the sampled target token (%d, '%s') did not match, or we ran out of drafted tokens\n", id, token_str.c_str());
 
             draft.clear();
             draft.push_back(id);
@@ -244,9 +258,12 @@ int main(int argc, char ** argv){
 
     auto t_dec_end = ggml_time_us();
 
-    // Update dynamic ngram cache with context ngram cache and save it to disk:
-    common_ngram_cache_merge(ngram_cache_dynamic, ngram_cache_context);
-    common_ngram_cache_save(ngram_cache_dynamic, params.lookup_cache_dynamic);
+    // Update dynamic ngram cache with context ngram cache and save it to disk if path supplied
+    if (!params.lookup_cache_dynamic.empty()) {
+        common_ngram_cache_merge(ngram_cache_dynamic, ngram_cache_context);
+        LOG_INF("0428 Check: writting ngram_cache to this file:  %s\n", params.lookup_cache_dynamic.c_str());
+        common_ngram_cache_save(ngram_cache_dynamic, params.lookup_cache_dynamic);
+    }
 
     LOG("\n\n");
 
@@ -269,8 +286,9 @@ int main(int argc, char ** argv){
         }
     }
     accept_list_str += "]";
-    LOG_INF("0420 Check: n_accept_list = %s\n", accept_list_str.c_str());
+    LOG_INF("0420 Check: len is %d, n_accept_list = %s\n", n_accept_list.size(), accept_list_str.c_str());
     LOG_INF("0420 Check: accept length average      = %.3f\n", average);
+    LOG_INF("0428 Check: no draft is suppiled forward times = %d\n", n_no_draft_forward);
 
     // Write to file if requested
     if (write_to_file) {
@@ -280,7 +298,8 @@ int main(int argc, char ** argv){
         } else {
             // First write the statistics as the first 3 lines
             output_file << "# Tokens: " << n_predict << ", Speed: " 
-                    << (n_predict  / ((t_dec_end - t_dec_start) / 1e6f)) << " t/s\n";
+                    << (n_predict  / ((t_dec_end - t_dec_start) / 1e6f)) << " t/s, # Forward: " 
+                    << n_accept_list.size() << "\n";
             output_file << "# Accept length average: " << average << "\n";
             output_file << "# Accept length list: " << accept_list_str << "\n";
             // Write all collected text at once

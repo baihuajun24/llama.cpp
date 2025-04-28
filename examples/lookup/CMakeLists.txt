@@ -66,20 +66,3 @@ target_link_libraries(${TARGET_REST} PRIVATE
     draftretriever_lib
 )
 target_compile_features(${TARGET_REST} PRIVATE cxx_std_17)
-
-# Add the load-datastore executable for Arrow file handling
-set(TARGET_LOAD_DATASTORE load-datastore)
-add_executable(${TARGET_LOAD_DATASTORE} load_datastore.cpp)
-install(TARGETS ${TARGET_LOAD_DATASTORE} RUNTIME)
-
-# Find Arrow package (this requires Arrow to be installed on your system)
-find_package(Arrow REQUIRED)
-
-# Link Arrow libraries
-target_link_libraries(${TARGET_LOAD_DATASTORE} PRIVATE 
-    arrow 
-    arrow_dataset
-    parquet
-    ${CMAKE_THREAD_LIBS_INIT}
-)
-target_compile_features(${TARGET_LOAD_DATASTORE} PRIVATE cxx_std_17)
