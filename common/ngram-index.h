@@ -1,170 +1,255 @@
-#pragma once
+#ifndef NGRAM_INDEX_H
+#define NGRAM_INDEX_H
 
 #include "llama.h"
-
-#include <unordered_map>
 #include <string>
 #include <vector>
+#include <unordered_map>
+#include <cstring>
+#include <array>
+#include <fstream>
 
-// Default max n-gram size, can be adjusted via command line
-#define NGRAM_INDEX_MAX_DEFAULT 4
+// Default maximum n-gram length
+#define NGRAM_INDEX_MAX_DEFAULT 6
 
-// Data structures for n-gram index lookup
+// Maximum buffer size for storing locations of n-gram occurrences
+#define NGRAM_LOCATION_BUFFER_SIZE 3
 
+/**
+ * Key for the n-gram index
+ * Represents an n-gram sequence as a fixed-size array of tokens
+ */
 struct ngram_index_key {
-    llama_token* tokens;
+    llama_token tokens[NGRAM_INDEX_MAX_DEFAULT];
     int size;
 
-    ngram_index_key(int max_size) {
-        size = max_size;
-        tokens = new llama_token[max_size];
-        for (int i = 0; i < max_size; ++i) {
-            tokens[i] = LLAMA_TOKEN_NULL;
+    // Create a key from a sequence of tokens
+    ngram_index_key(const llama_token* tokens_in, int size_in) {
+        size = std::min(size_in, NGRAM_INDEX_MAX_DEFAULT);
+        std::memcpy(tokens, tokens_in, size * sizeof(llama_token));
+    }
+
+    // Default constructor for map creation
+    ngram_index_key() : size(0) {
+        for (int i = 0; i < NGRAM_INDEX_MAX_DEFAULT; ++i) {
+            tokens[i] = 0;  // Initialize with zeros
         }
     }
 
-    ngram_index_key(const llama_token* input, int ngram_size, int max_size) {
-        size = max_size;
-        tokens = new llama_token[max_size];
-        for (int i = 0; i < max_size; ++i) {
-            tokens[i] = i < ngram_size ? input[i] : LLAMA_TOKEN_NULL;
-        }
-    }
-
-    ~ngram_index_key() {
-        delete[] tokens;
-    }
-
-    // Copy constructor
-    ngram_index_key(const ngram_index_key& other) {
-        size = other.size;
-        tokens = new llama_token[size];
-        for (int i = 0; i < size; ++i) {
-            tokens[i] = other.tokens[i];
-        }
-    }
-
-    // Move constructor
-    ngram_index_key(ngram_index_key&& other) noexcept {
-        size = other.size;
-        tokens = other.tokens;
-        other.tokens = nullptr;
-        other.size = 0;
-    }
-
-    // Copy assignment
-    ngram_index_key& operator=(const ngram_index_key& other) {
-        if (this != &other) {
-            delete[] tokens;
-            size = other.size;
-            tokens = new llama_token[size];
-            for (int i = 0; i < size; ++i) {
-                tokens[i] = other.tokens[i];
-            }
-        }
-        return *this;
-    }
-
-    // Move assignment
-    ngram_index_key& operator=(ngram_index_key&& other) noexcept {
-        if (this != &other) {
-            delete[] tokens;
-            size = other.size;
-            tokens = other.tokens;
-            other.tokens = nullptr;
-            other.size = 0;
-        }
-        return *this;
-    }
-
+    // Equality comparison for map lookup
     bool operator==(const ngram_index_key& other) const {
         if (size != other.size) return false;
-        for (int i = 0; i < size; ++i) {
-            if (tokens[i] != other.tokens[i]) {
-                return false;
-            }
-        }
-        return true;
+        return std::memcmp(tokens, other.tokens, size * sizeof(llama_token)) == 0;
     }
 };
 
+/**
+ * Hash function for n-gram index keys
+ */
 struct ngram_index_key_hash {
-    size_t operator()(const ngram_index_key& key) const {
-        size_t hash = 0;
+    std::size_t operator()(const ngram_index_key& key) const {
+        std::size_t hash = 0;
+        // Simple hash combining each token with size
         for (int i = 0; i < key.size; ++i) {
-            // Combine hashes using FNV-1a
-            hash ^= std::hash<llama_token>{}(key.tokens[i]);
-            hash *= 16777619;
+            hash = hash * 31 + key.tokens[i];
         }
+        hash = hash * 31 + key.size;
         return hash;
     }
 };
 
-// Value type: vector of indices where this n-gram appears in the prompt
-typedef std::vector<int> ngram_index_positions;
+/**
+ * Represents the location of an n-gram sequence
+ * Can point to a virtual prompt (in-memory) or a file on disk
+ */
+struct ngram_location {
+    enum class StorageType {
+        VIRTUAL_PROMPT,  // In-memory virtual prompt
+        DISK_FILE        // On-disk file storage
+    };
 
-// n-gram -> list of positions where this n-gram appears
-typedef std::unordered_map<ngram_index_key, ngram_index_positions, ngram_index_key_hash> ngram_index;
+    StorageType type;    // Type of storage
+    int source_id;       // ID of the source (prompt index or file ID)
+    size_t position;     // Position within the source
 
-// Build an n-gram index from a token sequence
-// token_sequence: the input token sequence to index
-// ngram_min/ngram_max: the min/max size of n-grams to index
-// max_indices_per_ngram: limit the number of indices stored per n-gram (0 = no limit)
-// print_progress: whether to print progress information
-ngram_index build_ngram_index(
-    const std::vector<llama_token>& token_sequence,
-    int ngram_min,
-    int ngram_max,
-    int max_indices_per_ngram = 0,
-    bool print_progress = false);
+    // Default constructor to fix std::array initialization
+    ngram_location() 
+        : type(StorageType::VIRTUAL_PROMPT), source_id(0), position(0) {}
 
-// Save an n-gram index to a file
-void save_ngram_index(ngram_index& index, const std::string& filename);
+    ngram_location(StorageType type_in, int source_id_in, size_t position_in)
+        : type(type_in), source_id(source_id_in), position(position_in) {}
+};
 
-// Load an n-gram index from a file
-ngram_index load_ngram_index(const std::string& filename);
+/**
+ * Fixed-size circular buffer to store n-gram locations
+ * Uses FIFO replacement strategy
+ */
+class location_buffer {
+private:
+    std::array<ngram_location, NGRAM_LOCATION_BUFFER_SIZE> locations;
+    int next_index;
+    int count;
 
-// Draft tokens using the n-gram index
-// inp: the current input sequence
-// draft: the draft sequence (initially contains one token)
-// n_draft: maximum number of tokens to draft
-// prompt: the original prompt used to build the index
-// index: the n-gram index
-// ngram_min/ngram_max: the min/max size of n-grams to use for lookup
-// selection_strategy: how to select from multiple positions (0=first, 1=random)
-void draft_with_ngram_index(
-    const std::vector<llama_token>& inp,
-    std::vector<llama_token>& draft,
-    int n_draft,
-    const std::vector<llama_token>& prompt,
-    const ngram_index& index,
-    int ngram_min,
-    int ngram_max,
-    int selection_strategy = 0);
+public:
+    // Initialize with default-constructed ngram_location objects
+    location_buffer() : next_index(0), count(0) {
+        // No additional initialization needed as ngram_location now has a default constructor
+    }
 
-// Print statistics about an n-gram index
-void print_ngram_index_stats(const ngram_index& index);
+    // Add a new location to the buffer (FIFO replacement)
+    void add(const ngram_location& loc) {
+        locations[next_index] = loc;
+        next_index = (next_index + 1) % NGRAM_LOCATION_BUFFER_SIZE;
+        if (count < NGRAM_LOCATION_BUFFER_SIZE) {
+            count++;
+        }
+    }
 
-// Update the ngram index with newly accepted tokens from user input
-// This would be used in a dynamic indexing scenario, or can be a no-op
-// if we're using a static index
-void ngram_index_update(
-    ngram_index& index,
-    const std::vector<llama_token>& tokens,
-    int ngram_min,
-    int ngram_max,
-    int n_tokens = 1,
-    bool reset = false);
+    // Get the number of locations stored
+    int size() const {
+        return count;
+    }
 
-// Draft tokens using the ngram index
-// Similar to common_ngram_cache_draft but using our ngram index structure
-// Add this to ngram-index.h
-void ngram_index_draft(
-    const std::vector<llama_token>& inp,
-    std::vector<llama_token>& draft,
-    int n_draft,
-    int ngram_min,
-    int ngram_max,
-    const ngram_index& index,
-    const std::vector<llama_token>& index_tokens,  // Add this parameter
-    int selection_strategy = 0);
+    // Check if the buffer is empty
+    bool empty() const {
+        return count == 0;
+    }
+
+    // Get the locations in order (most recently added last)
+    std::vector<ngram_location> get_locations() const {
+        std::vector<ngram_location> result;
+        result.reserve(count);
+        
+        // Start with oldest entry
+        int start = count < NGRAM_LOCATION_BUFFER_SIZE
+                  ? 0
+                  : next_index;
+                  
+        for (int i = 0; i < count; ++i) {
+            int idx = (start + i) % NGRAM_LOCATION_BUFFER_SIZE;
+            result.push_back(locations[idx]);
+        }
+        
+        return result;
+    }
+};
+
+/**
+ * Manager for virtual prompts and on-disk sources
+ * Handles loading, accessing, and caching source data
+ */
+class ngram_source_manager {
+private:
+    std::vector<std::vector<llama_token>> virtual_prompts;
+    // File handling will be added in a future implementation
+
+public:
+    // Add a new virtual prompt and return its ID
+    int add_virtual_prompt(const std::vector<llama_token>& tokens) {
+        int id = virtual_prompts.size();
+        virtual_prompts.push_back(tokens);
+        return id;
+    }
+
+    // Get token at a specific location
+    llama_token get_token_at_location(const ngram_location& loc) {
+        if (loc.type == ngram_location::StorageType::VIRTUAL_PROMPT) {
+            if (loc.source_id >= 0 && (size_t)loc.source_id < virtual_prompts.size() &&
+                loc.position < virtual_prompts[loc.source_id].size()) {
+                return virtual_prompts[loc.source_id][loc.position];
+            }
+        }
+        // File access will be implemented later
+        
+        return LLAMA_TOKEN_NULL;
+    }
+
+    // Get context around a location - retrieve tokens at and after a location
+    std::vector<llama_token> get_tokens_at_location(const ngram_location& loc, size_t n) {
+        std::vector<llama_token> result;
+        
+        if (loc.type == ngram_location::StorageType::VIRTUAL_PROMPT) {
+            if (loc.source_id >= 0 && (size_t)loc.source_id < virtual_prompts.size()) {
+                auto& tokens = virtual_prompts[loc.source_id];
+                size_t end = std::min(loc.position + n, tokens.size());
+                
+                for (size_t i = loc.position; i < end; ++i) {
+                    result.push_back(tokens[i]);
+                }
+            }
+        }
+        // File access will be implemented later
+        
+        return result;
+    }
+
+    // Clear all virtual prompts
+    void clear_virtual_prompts() {
+        virtual_prompts.clear();
+    }
+
+    // Get total size of all virtual prompts
+    size_t get_total_virtual_prompt_size() const {
+        size_t total = 0;
+        for (const auto& prompt : virtual_prompts) {
+            total += prompt.size();
+        }
+        return total;
+    }
+};
+
+/**
+ * Main n-gram index class
+ * Maps n-gram sequences to their locations for efficient retrieval
+ */
+class NGramIndex {
+private:
+    int ngram_min;  // Minimum n-gram size to index
+    int ngram_max;  // Maximum n-gram size to index
+    
+    // Main index mapping n-gram keys to their locations
+    std::unordered_map<ngram_index_key, location_buffer, ngram_index_key_hash> index;
+    
+    // Source data manager
+    ngram_source_manager source_manager;
+
+public:
+    // Constructor
+    NGramIndex(int min_n = 1, int max_n = NGRAM_INDEX_MAX_DEFAULT);
+
+    // Index a virtual prompt
+    int index_virtual_prompt(const std::vector<llama_token>& tokens);
+
+    // Draft using the n-gram index
+    llama_token draft(const llama_token* tokens, int n_tokens, llama_context* ctx);
+
+    // Save the index to a file
+    bool save(const std::string& filename);
+
+    // Load the index from a file
+    bool load(const std::string& filename);
+
+    // Merge with another index
+    void merge(const NGramIndex& other);
+
+    // Print statistics about the index
+    void print_stats() const;
+
+    // Clear the index
+    void clear();
+
+    // Access the raw index (for direct manipulation)
+    std::unordered_map<ngram_index_key, location_buffer, ngram_index_key_hash>& get_index() {
+        return index;
+    }
+
+    // Get read-only access to the raw index
+    const std::unordered_map<ngram_index_key, location_buffer, ngram_index_key_hash>& get_index() const {
+        return index;
+    }
+};
+
+// Global function to draft using an n-gram index
+llama_token draft_with_ngram_index(const NGramIndex& index, const llama_token* tokens, int n_tokens, llama_context* ctx);
+
+#endif // NGRAM_INDEX_H 
