@@ -18,7 +18,10 @@ struct build_params {
     std::vector<std::string> input_files;
     
     // Output file to save the index
-    std::string output_file = "static_ngram_index.bin";
+    std::string output_file = "basic_ngram_index.bin";
+    
+    // File to save prompt tokens
+    std::string prompt_tokens_file = "basic_prompt.bin";
     
     // Minimum n-gram size
     int ngram_min = 1;
@@ -31,6 +34,12 @@ struct build_params {
 
     // Model path
     std::string model_path;
+    
+    // Load existing index instead of building one
+    std::string load_index;
+    
+    // Flag to indicate we should test the index after building/loading
+    bool run_tests = false;
 };
 
 static void print_usage() {
@@ -38,6 +47,7 @@ static void print_usage() {
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -h, --help               Show this help message and exit\n");
     fprintf(stderr, "  -o, --output FILENAME    Output file for the built index (default: static_ngram_index.bin)\n");
+    fprintf(stderr, "  -p, --prompt FILENAME    Output file for prompt tokens (default: basic_prompt.bin)\n");
     fprintf(stderr, "  -m, --model FILENAME     Model path (required)\n");
     fprintf(stderr, "  --ngram-min N            Minimum n-gram size (default: 1)\n");
     fprintf(stderr, "  --ngram-max N            Maximum n-gram size (default: 6)\n");
@@ -58,6 +68,13 @@ static bool parse_params(int argc, char** argv, build_params& params) {
                 params.output_file = argv[i];
             } else {
                 fprintf(stderr, "Missing output filename after %s\n", arg.c_str());
+                valid = false;
+            }
+        } else if (arg == "-p" || arg == "--prompt") {
+            if (++i < argc) {
+                params.prompt_tokens_file = argv[i];
+            } else {
+                fprintf(stderr, "Missing prompt tokens filename after %s\n", arg.c_str());
                 valid = false;
             }
         } else if (arg == "-m" || arg == "--model") {
@@ -201,7 +218,8 @@ static NGramIndex build_optimized_index(
     const std::unordered_map<ngram_index_key, next_token_stats, ngram_index_key_hash>& stats,
     int ngram_min,
     int ngram_max,
-    bool verbose) {
+    bool verbose,
+    const std::string& prompt_path = "") {
         
     // Create a new index
     NGramIndex index(ngram_min, ngram_max);
@@ -246,25 +264,40 @@ static NGramIndex build_optimized_index(
         LOG_INF("\n");
     }
     
+    // Save prompt tokens to file if a path is provided
+    if (!prompt_path.empty() && !prompt_tokens.empty()) {
+        std::ofstream prompt_file(prompt_path, std::ios::binary);
+        if (prompt_file.is_open()) {
+            // Write the number of tokens
+            size_t num_tokens = prompt_tokens.size();
+            prompt_file.write(reinterpret_cast<const char*>(&num_tokens), sizeof(num_tokens));
+            
+            // Write all tokens
+            prompt_file.write(reinterpret_cast<const char*>(prompt_tokens.data()), 
+                             num_tokens * sizeof(llama_token));
+            
+            bool success = prompt_file.good();
+            if (success) {
+                LOG_INF("Successfully saved virtual prompt with %zu tokens to %s\n", 
+                        num_tokens, prompt_path.c_str());
+            } else {
+                LOG_INF("Error occurred while writing virtual prompt to %s\n", prompt_path.c_str());
+            }
+            
+            prompt_file.close();
+        } else {
+            LOG_ERR("Failed to open file for writing virtual prompt: %s\n", prompt_path.c_str());
+        }
+    }
+    
     // Now index the virtual prompt
     if (!prompt_tokens.empty()) {
-        
-        // Build pass: add direct references to the index
-        size_t entries_added = 0;
-        for (const auto& entry : ngram_positions) {
-            const ngram_index_key& key = entry.first;
-            size_t pos = entry.second;
-            
-            // Create location
-            ngram_location loc(ngram_location::StorageType::VIRTUAL_PROMPT, 0, pos);
-            
-            // Add to index directly - using non-const get_index()
-            index.get_index()[key].add(loc);
-            entries_added++;
-        }
+        // First, add the entire virtual prompt to the index
+        int source_id = index.index_virtual_prompt(prompt_tokens);
+        LOG_INF("Added virtual prompt to index with ID: %d\n", source_id);
         
         if (verbose) {
-            LOG_INF("Added %zu direct n-gram entries to index\n", entries_added);
+            LOG_INF("Added %zu direct n-gram entries to index\n", ngram_positions.size());
         }
     }
 
@@ -383,7 +416,7 @@ int main(int argc, char** argv) {
     }
     
     // Build optimized index
-    NGramIndex index = build_optimized_index(ngram_stats, params.ngram_min, params.ngram_max, params.verbose);
+    NGramIndex index = build_optimized_index(ngram_stats, params.ngram_min, params.ngram_max, params.verbose, params.prompt_tokens_file);
     
     // Print index statistics
     //index.print_stats();
@@ -397,6 +430,30 @@ int main(int argc, char** argv) {
     llama_free(ctx);
     llama_model_free(model);
     llama_backend_free();
+
+    // Can we write a part to load prompt from prompt_tokens_file?
+    // use a vector of llama_token to store the prompt tokens
+    std::vector<llama_token> vp_tokens;
+    std::ifstream prompt_file(params.prompt_tokens_file, std::ios::binary);
+    if (prompt_file.is_open()) {
+        // Read the number of tokens
+        size_t num_tokens;
+        prompt_file.read(reinterpret_cast<char*>(&num_tokens), sizeof(num_tokens));
+        // print tokens
+        for (size_t i = 0; i < num_tokens; i++) {
+            llama_token token;
+            prompt_file.read(reinterpret_cast<char*>(&token), sizeof(token));
+            vp_tokens.push_back(token);
+        }
+    }
     
+    // print the prompt tokens
+    LOG_INF("Prompt tokens:\n");
+    for (size_t i = 0; i < vp_tokens.size(); i++) {
+        LOG_INF("%d ", vp_tokens[i]);
+    }
+    LOG_INF("\n");
+    
+
     return 0;
 }

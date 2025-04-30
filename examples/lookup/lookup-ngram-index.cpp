@@ -151,6 +151,41 @@ int main(int argc, char** argv) {
     
     // Create a new n-gram index with the specified parameters
     NGramIndex nindex(idx_params.ngram_min, idx_params.ngram_max);
+
+    std::vector<llama_token> vp_tokens;
+    std::string prompt_tokens_file = "C:/Users/Administrator/Documents/ngram-spec/llama.cpp/build/bin/cache/basic_prompt.bin"; // HARDCODE for now
+    std::ifstream prompt_file(prompt_tokens_file, std::ios::binary);
+    if (prompt_file.is_open()) {
+        // Read the number of tokens
+        size_t num_tokens;
+        prompt_file.read(reinterpret_cast<char*>(&num_tokens), sizeof(num_tokens));
+        // print tokens
+        for (size_t i = 0; i < num_tokens; i++) {
+            llama_token token;
+            prompt_file.read(reinterpret_cast<char*>(&token), sizeof(token));
+            vp_tokens.push_back(token);
+        }
+    }
+
+    // print the prompt tokens
+    LOG_INF("[0430 check] vp_tokens:\n");
+    for (size_t i = 0; i < vp_tokens.size(); i++) {
+        LOG_INF("%d ", vp_tokens[i]);
+    }
+    LOG_INF("\n");
+
+    // if load index is not empty, nindex_static.load(idx_params.load_index);
+    if (!idx_params.load_index.empty()) {
+        NGramIndex nindex_static(idx_params.ngram_min, idx_params.ngram_max);
+        LOG_INF("Loading static index from %s\n", idx_params.load_index.c_str());
+        bool success = nindex_static.load(idx_params.load_index);
+        if (success) {
+            LOG_INF("Successfully loaded static index\n");
+            nindex.print_stats();
+        } else {
+            LOG_INF("Failed to load static index from %s\n", idx_params.load_index.c_str());
+        }
+    }
     
     // Initialize performance metrics
     int64_t t_draft_flat_us = 0;
@@ -259,7 +294,7 @@ int main(int argc, char** argv) {
             } else {
                 if ((int)draft.size() == 0) {
                     n_no_draft_forward += 1;
-                    LOG_INF("[Check] no draft caused accept length = %d\n", accept_length);
+                    // LOG_INF("[Check] no draft caused accept length = %d\n", accept_length);
                 }
             }
             
@@ -301,19 +336,30 @@ int main(int argc, char** argv) {
         // Use the multi-token drafting function to get a sequence of drafted tokens
         // This will fetch consecutive tokens from the virtual prompt
         std::vector<llama_token> drafted_tokens;
-        int n_drafted_tokens = draft_multiple_with_ngram_index(nindex, inp.data(), inp.size(), n_draft - 1, drafted_tokens, ctx);
+        int n_drafted_tokens = draft_multiple_with_ngram_index(nindex, inp.data(), inp.size(), n_draft, drafted_tokens, ctx);
         
         // Add the drafted tokens to our draft
         if (n_drafted_tokens > 0) {
             draft.insert(draft.end(), drafted_tokens.begin(), drafted_tokens.end());
+        }
+        else{
+            // no draft is found in prompt-index, fallback to static index
+            // simple O(n) search in vp_tokens
+            int last_token_id = inp.back();
+            for (size_t i = 0; i < vp_tokens.size() - 1; i += 2) {
+                // Check if this is a key token that matches our input token
+                if (vp_tokens[i] == last_token_id) { 
+                    // Found the key, now insert the NEXT token (the value) into the draft
+                    // This is always at position i+1 since tokens are stored as key-value pairs
+                    draft.push_back(vp_tokens[i + 1]);
+                    // LOG_INF("Found match in static index for token id: %d, next token: %d\n", last_token_id, vp_tokens[i + 1]);
+                    break;
+                }
+            }
             
-            // // Log the drafted sequence if verbose
-            // if (params.verbose) {
-            //     std::string draft_str = "";
-            //     for (size_t i = 1; i < draft.size(); i++) {
-            //         draft_str += common_token_to_piece(ctx, draft[i]);
-            //     }
-            //     LOG_INF("Drafted %zu tokens: \"%s\"\n", draft.size() - 1, draft_str.c_str());
+            // If no match was found, log it
+            // if (draft.empty()) {
+            //     LOG_INF("No match found in static index for token id: %d\n", last_token_id);
             // }
         }
         
