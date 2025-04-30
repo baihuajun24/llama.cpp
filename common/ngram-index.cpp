@@ -80,6 +80,69 @@ llama_token NGramIndex::draft(const llama_token* tokens, int n_tokens, llama_con
     return LLAMA_TOKEN_NULL;
 }
 
+// Draft multiple tokens using the n-gram index
+int NGramIndex::draft_multiple(const llama_token* tokens, int n_tokens, int n_draft, 
+                           std::vector<llama_token>& drafted_tokens, llama_context* /* ctx */) {
+    // Try different n-gram sizes, starting from the largest
+    for (int n = std::min(n_tokens, ngram_max); n >= ngram_min; --n) {
+        // Skip if we don't have enough tokens for this n-gram size
+        if (n > n_tokens) continue;
+        
+        // Create key from the last n tokens
+        ngram_index_key key(tokens + (n_tokens - n), n);
+        
+        // Look up in the index
+        auto it = index.find(key);
+        if (it != index.end() && !it->second.empty()) {
+            // Get locations for this n-gram
+            auto locations = it->second.get_locations();
+            
+            // For now, we'll use the most recently added location
+            // More sophisticated selection strategies could be implemented here
+            const auto& loc = locations.back();
+            
+            // Check that the location is a virtual prompt
+            if (loc.type != ngram_location::StorageType::VIRTUAL_PROMPT) {
+                continue; // Only support virtual prompts for now
+            }
+            
+            // Get the source ID and position
+            int source_id = loc.source_id;
+            size_t position = loc.position;
+            
+            // Make sure we have a valid source
+            if (source_id < 0 || (size_t)source_id >= source_manager.get_total_virtual_prompt_size()) {
+                continue;
+            }
+            
+            // Clear any existing drafted tokens
+            drafted_tokens.clear();
+            
+            // Get tokens from the virtual prompt starting at position + n (after the matched n-gram)
+            for (int i = 0; i < n_draft; ++i) {
+                // Get the next token
+                llama_token next_token = source_manager.get_token_at_location(
+                    ngram_location(loc.type, source_id, position + n + i)
+                );
+                
+                // Stop if we hit the end of the virtual prompt or an invalid token
+                if (next_token == LLAMA_TOKEN_NULL) {
+                    break;
+                }
+                
+                // Add the token to the draft
+                drafted_tokens.push_back(next_token);
+            }
+            
+            // Return the number of tokens drafted
+            return drafted_tokens.size();
+        }
+    }
+    
+    // No tokens drafted
+    return 0;
+}
+
 // Save the index to a file
 bool NGramIndex::save(const std::string& filename) {
     std::ofstream file(filename, std::ios::binary);
@@ -300,4 +363,10 @@ void NGramIndex::clear() {
 // Global function to draft using an n-gram index
 llama_token draft_with_ngram_index(const NGramIndex& index, const llama_token* tokens, int n_tokens, llama_context* ctx) {
     return const_cast<NGramIndex&>(index).draft(tokens, n_tokens, ctx);
+}
+
+// Global function to draft multiple tokens with an n-gram index
+int draft_multiple_with_ngram_index(const NGramIndex& index, const llama_token* tokens, int n_tokens, 
+                                int n_draft, std::vector<llama_token>& drafted_tokens, llama_context* ctx) {
+    return const_cast<NGramIndex&>(index).draft_multiple(tokens, n_tokens, n_draft, drafted_tokens, ctx);
 }

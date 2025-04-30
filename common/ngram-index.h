@@ -220,8 +220,13 @@ public:
     // Index a virtual prompt
     int index_virtual_prompt(const std::vector<llama_token>& tokens);
 
-    // Draft using the n-gram index
+    // Draft using the n-gram index (returns a single token)
     llama_token draft(const llama_token* tokens, int n_tokens, llama_context* ctx);
+    
+    // Draft multiple tokens using the n-gram index
+    // Returns the number of tokens added to the draft
+    int draft_multiple(const llama_token* tokens, int n_tokens, int n_draft, 
+                       std::vector<llama_token>& drafted_tokens, llama_context* ctx);
 
     // Save the index to a file
     bool save(const std::string& filename);
@@ -249,7 +254,11 @@ public:
     }
 };
 
-// Global function to draft using an n-gram index
+// Global function to draft using an n-gram index (single token)
 llama_token draft_with_ngram_index(const NGramIndex& index, const llama_token* tokens, int n_tokens, llama_context* ctx);
+
+// Global function to draft multiple tokens at once
+int draft_multiple_with_ngram_index(const NGramIndex& index, const llama_token* tokens, int n_tokens, 
+                                    int n_draft, std::vector<llama_token>& drafted_tokens, llama_context* ctx);
 
 #endif // NGRAM_INDEX_H 
