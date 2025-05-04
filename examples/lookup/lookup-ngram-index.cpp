@@ -174,14 +174,15 @@ int main(int argc, char** argv) {
     }
     LOG_INF("\n");
 
-    // if load index is not empty, nindex_static.load(idx_params.load_index);
+    // if load index is not empty, load the index from file
+    NGramIndex nindex_static(idx_params.ngram_min, idx_params.ngram_max);
+    bool static_index_loaded = false;
     if (!idx_params.load_index.empty()) {
-        NGramIndex nindex_static(idx_params.ngram_min, idx_params.ngram_max);
         LOG_INF("Loading static index from %s\n", idx_params.load_index.c_str());
-        bool success = nindex_static.load(idx_params.load_index);
-        if (success) {
+        static_index_loaded = nindex_static.load(idx_params.load_index);
+        if (static_index_loaded) {
             LOG_INF("Successfully loaded static index\n");
-            nindex.print_stats();
+            nindex_static.print_stats();
         } else {
             LOG_INF("Failed to load static index from %s\n", idx_params.load_index.c_str());
         }
@@ -194,7 +195,13 @@ int main(int argc, char** argv) {
     {
         // Fill up n-gram index with tokens from user input
         const int64_t t_start_draft_us = ggml_time_us();
-        nindex.index_virtual_prompt(inp);
+        
+        // Use the initial prompt to build the index
+        if (!inp.empty()) {
+            // Index the entire prompt at once
+            nindex.index_prompt(inp);
+        }
+        
         t_draft_flat_us += ggml_time_us() - t_start_draft_us;
     }
     
@@ -282,7 +289,8 @@ int main(int argc, char** argv) {
                 {
                     // Update n-gram index with the newly accepted token
                     const int64_t t_start_draft_us = ggml_time_us();
-                    // nindex.index_virtual_prompt({id}); // ngram-index update not implemented yet
+                    // Add the new token to the index (context now includes the new token)
+                    nindex.add_token(inp.data(), inp.size());
                     t_draft_us += ggml_time_us() - t_start_draft_us;
                 }
                 
@@ -308,7 +316,8 @@ int main(int argc, char** argv) {
             {
                 // Update n-gram index with the newly accepted token
                 const int64_t t_start_draft_us = ggml_time_us();
-                // nindex.index_virtual_prompt({id}); // ngram-index update not implemented yet
+                // Add the new token to the index (context now includes the new token)
+                nindex.add_token(inp.data(), inp.size());
                 t_draft_us += ggml_time_us() - t_start_draft_us;
             }
             break;
@@ -333,35 +342,28 @@ int main(int argc, char** argv) {
         
         const int64_t t_start_draft_us = ggml_time_us();
         
-        // Use the multi-token drafting function to get a sequence of drafted tokens
-        // This will fetch consecutive tokens from the virtual prompt
-        std::vector<llama_token> drafted_tokens;
-        int n_drafted_tokens = draft_multiple_with_ngram_index(nindex, inp.data(), inp.size(), n_draft, drafted_tokens, ctx);
+        // Use the n-gram index to draft tokens
+        int n_drafted_tokens = nindex.draft(inp, draft, n_draft);
         
-        // Add the drafted tokens to our draft
-        if (n_drafted_tokens > 0) {
-            draft.insert(draft.end(), drafted_tokens.begin(), drafted_tokens.end());
+        // If no tokens were drafted from the main index and static index is loaded, try it
+        if (n_drafted_tokens == 0 && static_index_loaded) {
+            n_drafted_tokens = nindex_static.draft(inp, draft, n_draft);
         }
-        else{
-            // no draft is found in prompt-index, fallback to static index
-            // simple O(n) search in vp_tokens
-            int last_token_id = inp.back();
-            for (size_t i = 0; i < vp_tokens.size() - 1; i += 2) {
-                // Check if this is a key token that matches our input token
-                if (vp_tokens[i] == last_token_id) { 
-                    // Found the key, now insert the NEXT token (the value) into the draft
-                    // This is always at position i+1 since tokens are stored as key-value pairs
-                    draft.push_back(vp_tokens[i + 1]);
-                    // LOG_INF("Found match in static index for token id: %d, next token: %d\n", last_token_id, vp_tokens[i + 1]);
-                    break;
-                }
-            }
-            
-            // If no match was found, log it
-            // if (draft.empty()) {
-            //     LOG_INF("No match found in static index for token id: %d\n", last_token_id);
-            // }
-        }
+        
+        // // Fallback to simple pair lookup if no drafts from indices
+        // if (n_drafted_tokens == 0 && vp_tokens.size() > 0) {
+        //     int last_token_id = inp.back();
+        //     for (size_t i = 0; i < vp_tokens.size() - 1; i += 2) {
+        //         // Check if this is a key token that matches our input token
+        //         if (vp_tokens[i] == last_token_id) { 
+        //             // Found the key, now insert the NEXT token (the value) into the draft
+        //             // This is always at position i+1 since tokens are stored as key-value pairs
+        //             draft.push_back(vp_tokens[i + 1]);
+        //             n_drafted_tokens = 1;
+        //             break;
+        //         }
+        //     }
+        // }
         
         t_draft_us += ggml_time_us() - t_start_draft_us;
         n_drafted += draft.size() - 1;

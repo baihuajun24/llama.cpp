@@ -1,192 +1,185 @@
 #include "ngram-index.h"
 #include "common.h"
 #include "log.h"
+
 #include <iostream>
 #include <algorithm>
+#include <fstream>
 #include <cstring>
 
-// Constructor
-NGramIndex::NGramIndex(int min_n, int max_n) 
+// Constructor with parameter validation
+NGramIndex::NGramIndex(int min_n, int max_n, int loc_max) 
     : ngram_min(min_n), 
-      ngram_max(std::min(max_n, NGRAM_INDEX_MAX_DEFAULT)) {
+      ngram_max(std::min(max_n, LLAMA_NGRAM_MAX)),
+      location_max(loc_max) {
+    
     // Validate n-gram size limits
     if (ngram_min < 1) {
         LOG_INF("Minimum n-gram size %d is less than 1, setting to 1", ngram_min);
         ngram_min = 1;
     }
+    
     if (ngram_max < ngram_min) {
         LOG_INF("Maximum n-gram size %d is less than minimum %d, setting to %d", 
-                    ngram_max, ngram_min, ngram_min);
+                ngram_max, ngram_min, ngram_min);
         ngram_max = ngram_min;
+    }
+    
+    if (location_max < 1) {
+        LOG_INF("Maximum locations %d is less than 1, setting to %d", 
+                location_max, LLAMA_LOCATION_MAX);
+        location_max = LLAMA_LOCATION_MAX;
     }
 }
 
-// Index a virtual prompt
-int NGramIndex::index_virtual_prompt(const std::vector<llama_token>& tokens) {
-    // Add the tokens to the source manager and get the source ID
-    int source_id = source_manager.add_virtual_prompt(tokens);
+// Initialize index with a sequence of tokens
+void NGramIndex::index_prompt(const std::vector<llama_token>& tokens) {
+    // Clear existing data
+    clear();
+    
+    // Store tokens
+    prompt_tokens = tokens;
     
     // Process all possible n-grams within the size limits
     for (int n = ngram_min; n <= ngram_max; ++n) {
         for (size_t i = 0; i + n <= tokens.size(); ++i) {
             // Create n-gram key from the current sequence
-            ngram_index_key key(&tokens[i], n);
+            common_ngram key(&tokens[i], n);
             
             // Add the location to the index
-            index[key].add(ngram_location(
-                ngram_location::StorageType::VIRTUAL_PROMPT,
-                source_id,
-                i
-            ));
+            index[key].add(ngram_location(i));
         }
     }
     
-    return source_id;
+    LOG_INF("Indexed %zu tokens with %zu unique n-grams", tokens.size(), index.size());
 }
 
-// Draft using the n-gram index
-llama_token NGramIndex::draft(const llama_token* tokens, int n_tokens, llama_context* /* ctx */) {
-    // Try different n-gram sizes, starting from the largest
-    for (int n = std::min(n_tokens, ngram_max); n >= ngram_min; --n) {
-        // Skip if we don't have enough tokens for this n-gram size
-        if (n > n_tokens) continue;
+// Add a single token to the index incrementally
+void NGramIndex::add_token(const llama_token* context, int context_size) {
+    // Validate context
+    if (context == nullptr || context_size <= 0) {
+        return;
+    }
+    
+    // Get the new token (last one in context)
+    llama_token new_token = context[context_size - 1];
+    
+    // Add the token to our prompt tokens
+    prompt_tokens.push_back(new_token);
+    
+    // Current position in prompt_tokens
+    int32_t position = prompt_tokens.size() - 1;
+    
+    // Add n-grams of different sizes ending with the new token
+    for (int n = ngram_min; n <= ngram_max && n <= context_size; ++n) {
+        // Calculate how many tokens we need from the context
+        int start_pos = context_size - n;
         
-        // Create key from the last n tokens
-        ngram_index_key key(tokens + (n_tokens - n), n);
+        // Create an n-gram key
+        common_ngram key(&context[start_pos], n);
+        
+        // Add the location to the index
+        index[key].add(ngram_location(position - (n - 1)));
+    }
+}
+
+// Draft tokens based on context
+int NGramIndex::draft(const std::vector<llama_token>& inp, std::vector<llama_token>& draft, int n_draft) {
+    // Make sure we have some context and draft has at least one token
+    if (inp.empty() || draft.empty() || n_draft <= 0) {
+        return 0;
+    }
+    
+    // Keep the first token in draft (the previously sampled token)
+    llama_token first_token = draft[0];
+    
+    // Reset draft to just the first token
+    draft.resize(1);
+    
+    // The total tokens added to draft
+    int tokens_added = 0;
+    
+    // Try different n-gram sizes, starting from the largest
+    for (int n = std::min((int)inp.size(), ngram_max); n >= ngram_min; --n) {
+        // Skip if we don't have enough tokens for this n-gram size
+        if (n > (int)inp.size()) continue;
+        
+        // Create key from the last n tokens in inp
+        common_ngram key(&inp[inp.size() - n], n);
         
         // Look up in the index
         auto it = index.find(key);
         if (it != index.end() && !it->second.empty()) {
             // Get locations for this n-gram
-            auto locations = it->second.get_locations();
+            const auto& locations = it->second.get_locations();
             
-            // For now, we'll use the most recently added location
-            // More sophisticated selection strategies could be implemented here
+            // Use the most recently added location
             const auto& loc = locations.back();
             
-            // Get the token following this n-gram
-            llama_token next_token = source_manager.get_token_at_location(
-                ngram_location(loc.type, loc.source_id, loc.position + n)
-            );
+            // The position after the n-gram in prompt_tokens
+            int32_t next_pos = loc.index + n;
             
-            // Check if we got a valid token
-            if (next_token != LLAMA_TOKEN_NULL) {
-                return next_token;
-            }
-        }
-    }
-    
-    // No draft available
-    return LLAMA_TOKEN_NULL;
-}
-
-// Draft multiple tokens using the n-gram index
-int NGramIndex::draft_multiple(const llama_token* tokens, int n_tokens, int n_draft, 
-                           std::vector<llama_token>& drafted_tokens, llama_context* /* ctx */) {
-    // Try different n-gram sizes, starting from the largest
-    for (int n = std::min(n_tokens, ngram_max); n >= ngram_min; --n) {
-        // Skip if we don't have enough tokens for this n-gram size
-        if (n > n_tokens) continue;
-        
-        // Create key from the last n tokens
-        ngram_index_key key(tokens + (n_tokens - n), n);
-        
-        // Look up in the index
-        auto it = index.find(key);
-        if (it != index.end() && !it->second.empty()) {
-            // Get locations for this n-gram
-            auto locations = it->second.get_locations();
-            
-            // For now, we'll use the most recently added location
-            // More sophisticated selection strategies could be implemented here
-            const auto& loc = locations.back();
-            
-            // Check that the location is a virtual prompt
-            if (loc.type != ngram_location::StorageType::VIRTUAL_PROMPT) {
-                continue; // Only support virtual prompts for now
-            }
-            
-            // Get the source ID and position
-            int source_id = loc.source_id;
-            size_t position = loc.position;
-            
-            // Make sure we have a valid source
-            if (source_id < 0 || (size_t)source_id >= source_manager.get_total_virtual_prompt_size()) {
-                continue;
-            }
-            
-            // Clear any existing drafted tokens
-            drafted_tokens.clear();
-            
-            // Get tokens from the virtual prompt starting at position + n (after the matched n-gram)
-            for (int i = 0; i < n_draft; ++i) {
+            // Add tokens to the draft until we reach n_draft or the end of prompt_tokens
+            while (tokens_added < n_draft && next_pos < (int32_t)prompt_tokens.size()) {
                 // Get the next token
-                llama_token next_token = source_manager.get_token_at_location(
-                    ngram_location(loc.type, source_id, position + n + i)
-                );
+                llama_token next_token = prompt_tokens[next_pos++];
                 
-                // Stop if we hit the end of the virtual prompt or an invalid token
-                if (next_token == LLAMA_TOKEN_NULL) {
-                    break;
-                }
-                
-                // Add the token to the draft
-                drafted_tokens.push_back(next_token);
+                // Add it to the draft
+                draft.push_back(next_token);
+                tokens_added++;
             }
             
-            // Return the number of tokens drafted
-            return drafted_tokens.size();
+            // If we added tokens, return
+            if (tokens_added > 0) {
+                return tokens_added;
+            }
         }
     }
     
-    // No tokens drafted
+    // No tokens added
     return 0;
 }
 
 // Save the index to a file
-bool NGramIndex::save(const std::string& filename) {
-    std::ofstream file(filename, std::ios::binary);
+bool NGramIndex::save(const std::string& file_path) const {
+    std::ofstream file(file_path, std::ios::binary);
     if (!file.is_open()) {
-        LOG_INF("Failed to open file for writing: %s", filename.c_str());
+        LOG_ERR("Failed to open file for writing: %s", file_path.c_str());
         return false;
     }
     
-    // Write the header
-    file.write("NGRMIDX1", 8); // File signature and version
+    // Write file signature and version
+    const char* signature = "NGRAMIDX";
+    file.write(signature, 8);
     
-    // Write n-gram size limits
+    // Write configuration
     file.write(reinterpret_cast<const char*>(&ngram_min), sizeof(ngram_min));
     file.write(reinterpret_cast<const char*>(&ngram_max), sizeof(ngram_max));
+    file.write(reinterpret_cast<const char*>(&location_max), sizeof(location_max));
     
-    // Write the number of virtual prompts
-    size_t num_prompts = source_manager.get_total_virtual_prompt_size();
-    file.write(reinterpret_cast<const char*>(&num_prompts), sizeof(num_prompts));
+    // Write prompt tokens
+    size_t token_count = prompt_tokens.size();
+    file.write(reinterpret_cast<const char*>(&token_count), sizeof(token_count));
+    for (const auto& token : prompt_tokens) {
+        file.write(reinterpret_cast<const char*>(&token), sizeof(token));
+    }
     
-    // For now, we only save the index structure, not the actual virtual prompts
-    // A more complete implementation would save the virtual prompts as well
-    
-    // Write the number of entries in the index
-    size_t num_entries = index.size();
-    file.write(reinterpret_cast<const char*>(&num_entries), sizeof(num_entries));
+    // Write index size
+    size_t index_size = index.size();
+    file.write(reinterpret_cast<const char*>(&index_size), sizeof(index_size));
     
     // Write each index entry
     for (const auto& entry : index) {
         // Write the key
-        file.write(reinterpret_cast<const char*>(&entry.first.size), sizeof(entry.first.size));
-        file.write(reinterpret_cast<const char*>(entry.first.tokens), 
-                   entry.first.size * sizeof(llama_token));
+        file.write(reinterpret_cast<const char*>(&entry.first), sizeof(entry.first));
         
-        // Write the number of locations
-        int num_locations = entry.second.size();
-        file.write(reinterpret_cast<const char*>(&num_locations), sizeof(num_locations));
+        // Write locations
+        const auto& locations = entry.second.get_locations();
+        size_t loc_count = locations.size();
+        file.write(reinterpret_cast<const char*>(&loc_count), sizeof(loc_count));
         
-        // Write each location
-        auto locations = entry.second.get_locations();
         for (const auto& loc : locations) {
-            int type_int = static_cast<int>(loc.type);
-            file.write(reinterpret_cast<const char*>(&type_int), sizeof(type_int));
-            file.write(reinterpret_cast<const char*>(&loc.source_id), sizeof(loc.source_id));
-            file.write(reinterpret_cast<const char*>(&loc.position), sizeof(loc.position));
+            file.write(reinterpret_cast<const char*>(&loc.index), sizeof(loc.index));
         }
     }
     
@@ -194,179 +187,116 @@ bool NGramIndex::save(const std::string& filename) {
 }
 
 // Load the index from a file
-bool NGramIndex::load(const std::string& filename) {
-    std::ifstream file(filename, std::ios::binary);
+bool NGramIndex::load(const std::string& file_path) {
+    std::ifstream file(file_path, std::ios::binary);
     if (!file.is_open()) {
-        LOG_INF("Failed to open file for reading: %s", filename.c_str());
-        return false;
-    }
-    
-    // Read and verify the header
-    char signature[8];
-    file.read(signature, 8);
-    if (std::strncmp(signature, "NGRMIDX1", 8) != 0) {
-        LOG_INF("Invalid file format or version: %s", filename.c_str());
+        LOG_ERR("Failed to open file for reading: %s", file_path.c_str());
         return false;
     }
     
     // Clear existing data
     clear();
     
-    // Read n-gram size limits
+    // Read and verify file signature
+    char signature[9] = {0};
+    file.read(signature, 8);
+    if (strcmp(signature, "NGRAMIDX") != 0) {
+        LOG_ERR("Invalid file format or signature");
+        return false;
+    }
+    
+    // Read configuration
     file.read(reinterpret_cast<char*>(&ngram_min), sizeof(ngram_min));
     file.read(reinterpret_cast<char*>(&ngram_max), sizeof(ngram_max));
+    file.read(reinterpret_cast<char*>(&location_max), sizeof(location_max));
     
-    // Read the number of virtual prompts
-    size_t num_prompts;
-    file.read(reinterpret_cast<char*>(&num_prompts), sizeof(num_prompts));
+    // Read prompt tokens
+    size_t token_count;
+    file.read(reinterpret_cast<char*>(&token_count), sizeof(token_count));
+    prompt_tokens.resize(token_count);
+    for (size_t i = 0; i < token_count; i++) {
+        file.read(reinterpret_cast<char*>(&prompt_tokens[i]), sizeof(llama_token));
+    }
     
-    // For now, we don't load virtual prompts
-    // A more complete implementation would load them
-    
-    // Read the number of entries in the index
-    size_t num_entries;
-    file.read(reinterpret_cast<char*>(&num_entries), sizeof(num_entries));
+    // Read index size
+    size_t index_size;
+    file.read(reinterpret_cast<char*>(&index_size), sizeof(index_size));
     
     // Read each index entry
-    for (size_t i = 0; i < num_entries; ++i) {
+    for (size_t i = 0; i < index_size; i++) {
         // Read the key
-        ngram_index_key key;
-        file.read(reinterpret_cast<char*>(&key.size), sizeof(key.size));
-        file.read(reinterpret_cast<char*>(key.tokens), key.size * sizeof(llama_token));
+        common_ngram key;
+        file.read(reinterpret_cast<char*>(&key), sizeof(key));
         
-        // Read the number of locations
-        int num_locations;
-        file.read(reinterpret_cast<char*>(&num_locations), sizeof(num_locations));
+        // Read locations
+        size_t loc_count;
+        file.read(reinterpret_cast<char*>(&loc_count), sizeof(loc_count));
         
-        // Create a location buffer
-        location_buffer buffer;
+        // Create location buffer with proper size
+        location_buffer buf(location_max);
         
         // Read each location
-        for (int j = 0; j < num_locations; ++j) {
-            int type_int;
-            int source_id;
-            size_t position;
-            
-            file.read(reinterpret_cast<char*>(&type_int), sizeof(type_int));
-            file.read(reinterpret_cast<char*>(&source_id), sizeof(source_id));
-            file.read(reinterpret_cast<char*>(&position), sizeof(position));
-            
-            ngram_location::StorageType type = 
-                static_cast<ngram_location::StorageType>(type_int);
-            
-            buffer.add(ngram_location(type, source_id, position));
+        for (size_t j = 0; j < loc_count; j++) {
+            int32_t idx;
+            file.read(reinterpret_cast<char*>(&idx), sizeof(idx));
+            buf.add(ngram_location(idx));
         }
         
-        // Add to the index
-        index[key] = buffer;
+        // Add to index
+        index[key] = buf;
     }
     
+    LOG_INF("Loaded index with %zu tokens and %zu n-grams", prompt_tokens.size(), index.size());
     return file.good();
-}
-
-// Merge with another index
-void NGramIndex::merge(const NGramIndex& other) {
-    // Adjust n-gram size limits if necessary
-    ngram_min = std::min(ngram_min, other.ngram_min);
-    ngram_max = std::max(ngram_max, other.ngram_max);
-    
-    // Merge index entries
-    for (const auto& entry : other.get_index()) {
-        auto& dest_buffer = index[entry.first];
-        auto locations = entry.second.get_locations();
-        
-        // Add each location to our buffer
-        for (const auto& loc : locations) {
-            dest_buffer.add(loc);
-        }
-    }
 }
 
 // Print statistics about the index
 void NGramIndex::print_stats() const {
-    // Count n-grams of each size
-    std::vector<int> counts(ngram_max + 1, 0);
+    std::cout << "NGramIndex Statistics:" << std::endl;
+    std::cout << "---------------------" << std::endl;
+    std::cout << "Configuration:" << std::endl;
+    std::cout << "  Min n-gram size: " << ngram_min << std::endl;
+    std::cout << "  Max n-gram size: " << ngram_max << std::endl;
+    std::cout << "  Max locations per n-gram: " << location_max << std::endl;
+    std::cout << "Content:" << std::endl;
+    std::cout << "  Prompt tokens: " << prompt_tokens.size() << std::endl;
+    std::cout << "  Unique n-grams: " << index.size() << std::endl;
     
+    // Count n-grams by size
+    std::vector<int> counts(ngram_max + 1, 0);
     for (const auto& entry : index) {
-        counts[entry.first.size]++;
+        // Determine the actual n-gram size by counting non-null tokens
+        int size = 0;
+        for (int i = 0; i < LLAMA_NGRAM_MAX; i++) {
+            if (entry.first.tokens[i] != LLAMA_TOKEN_NULL) {
+                size++;
+            } else {
+                break;
+            }
+        }
+        if (size > 0 && size <= ngram_max) {
+            counts[size]++;
+        }
     }
     
-    // Print statistics
-    std::cout << "N-gram index statistics:" << std::endl;
-    std::cout << "  Total entries: " << index.size() << std::endl;
-    
-    for (int n = ngram_min; n <= ngram_max; ++n) {
+    // Print n-gram counts by size
+    for (int n = ngram_min; n <= ngram_max; n++) {
         std::cout << "  " << n << "-grams: " << counts[n] << std::endl;
     }
     
-    // Calculate memory usage (approximate)
-    size_t memory_usage = sizeof(NGramIndex);
-    memory_usage += index.size() * (sizeof(ngram_index_key) + sizeof(location_buffer));
+    // Calculate approximate memory usage
+    size_t mem_tokens = prompt_tokens.size() * sizeof(llama_token);
+    size_t mem_index = index.size() * (sizeof(common_ngram) + sizeof(location_buffer));
+    size_t mem_total = mem_tokens + mem_index + sizeof(NGramIndex);
     
-    std::cout << "  Approximate memory usage: " << (memory_usage / 1024) << " KB" << std::endl;
-    
-    // Print detailed index information for debugging
-    std::cout << "\nDetailed index contents (first 20 entries):" << std::endl;
-    std::cout << "------------------------------------------" << std::endl;
-    
-    int count = 0;
-    for (const auto& entry : index) {
-        if (count >= 20) break;
-        
-        const ngram_index_key& key = entry.first;
-        const location_buffer& locs = entry.second;
-        
-        // Print the key
-        std::cout << "  Key: [";
-        for (int i = 0; i < key.size; i++) {
-            std::cout << key.tokens[i];
-            if (i < key.size - 1) std::cout << ", ";
-        }
-        std::cout << "]" << std::endl;
-        
-        // Print the locations
-        std::cout << "  Locations (" << locs.size() << "):" << std::endl;
-        
-        // Get the locations as a vector
-        auto locations = locs.get_locations();
-        for (size_t i = 0; i < locations.size(); i++) {
-            const auto& loc = locations[i];
-            std::cout << "    - Type: " << static_cast<int>(loc.type) 
-                      << ", Source: " << loc.source_id
-                      << ", Position: " << loc.position << std::endl;
-        }
-        
-        std::cout << std::endl;
-        count++;
-    }
-    
-    // Print verification of token type counts in the virtual prompts
-    std::cout << "\nVirtual prompt analysis:" << std::endl;
-    std::cout << "-------------------------" << std::endl;
-    
-    int total_virtual_prompts = source_manager.get_total_virtual_prompt_size();
-    std::cout << "  Total virtual prompts: " << total_virtual_prompts << std::endl;
-    
-    // Since we can't directly access tokens, provide information about how to do so
-    std::cout << "  To see virtual prompt tokens, add them to the prompt array first" << std::endl;
-    std::cout << "  and then use logging in your build_optimized_index function." << std::endl;
-    
-    std::cout << "------------------------------------------" << std::endl;
+    std::cout << "Memory usage (approximate):" << std::endl;
+    std::cout << "  Tokens: " << mem_tokens / 1024 << " KB" << std::endl;
+    std::cout << "  Index: " << mem_index / 1024 << " KB" << std::endl;
+    std::cout << "  Total: " << mem_total / 1024 << " KB" << std::endl;
 }
 
 // Clear the index
 void NGramIndex::clear() {
+    prompt_tokens.clear();
     index.clear();
-    source_manager.clear_virtual_prompts();
-}
-
-// Global function to draft using an n-gram index
-llama_token draft_with_ngram_index(const NGramIndex& index, const llama_token* tokens, int n_tokens, llama_context* ctx) {
-    return const_cast<NGramIndex&>(index).draft(tokens, n_tokens, ctx);
-}
-
-// Global function to draft multiple tokens with an n-gram index
-int draft_multiple_with_ngram_index(const NGramIndex& index, const llama_token* tokens, int n_tokens, 
-                                int n_draft, std::vector<llama_token>& drafted_tokens, llama_context* ctx) {
-    return const_cast<NGramIndex&>(index).draft_multiple(tokens, n_tokens, n_draft, drafted_tokens, ctx);
 }
