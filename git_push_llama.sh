@@ -13,9 +13,8 @@ while true; do
         # Exit the loop on success
         break
     else
-        echo "$(date): Push failed. Will retry in 30 minutes."
-        # Wait for 30 minutes (1800 seconds)
-        sleep 1800
+        echo "$(date): Push failed. Will retry in 20 seconds."
+        sleep 20
     fi
 done
 
