@@ -152,40 +152,23 @@ int main(int argc, char** argv) {
     // Create a new n-gram index with the specified parameters
     NGramIndex nindex(idx_params.ngram_min, idx_params.ngram_max);
 
-    std::vector<llama_token> vp_tokens;
-    std::string prompt_tokens_file = "C:/Users/Administrator/Documents/ngram-spec/llama.cpp/build/bin/cache/basic_prompt.bin"; // HARDCODE for now
-    std::ifstream prompt_file(prompt_tokens_file, std::ios::binary);
-    if (prompt_file.is_open()) {
-        // Read the number of tokens
-        size_t num_tokens;
-        prompt_file.read(reinterpret_cast<char*>(&num_tokens), sizeof(num_tokens));
-        // print tokens
-        for (size_t i = 0; i < num_tokens; i++) {
-            llama_token token;
-            prompt_file.read(reinterpret_cast<char*>(&token), sizeof(token));
-            vp_tokens.push_back(token);
-        }
-    }
-
-    // print the prompt tokens
-    LOG_INF("[0430 check] vp_tokens:\n");
-    for (size_t i = 0; i < vp_tokens.size(); i++) {
-        LOG_INF("%d ", vp_tokens[i]);
-    }
-    LOG_INF("\n");
-
     // if load index is not empty, load the index from file
     NGramIndex nindex_static(idx_params.ngram_min, idx_params.ngram_max);
-    bool static_index_loaded = false;
-    if (!idx_params.load_index.empty()) {
-        LOG_INF("Loading static index from %s\n", idx_params.load_index.c_str());
-        static_index_loaded = nindex_static.load(idx_params.load_index);
+    
+    // 0505 testing: HARDCODE for now
+    bool static_index_loaded = true;
+    if (static_index_loaded) {
+        std::string INDEX_PATH = "/Users/baihuajun/Documents/llama.cpp/ngram-spec/cache/ngram_index.bin";
+        LOG_INF("Loading static index from %s\n", INDEX_PATH.c_str());
+        static_index_loaded = nindex_static.load(INDEX_PATH);
         if (static_index_loaded) {
             LOG_INF("Successfully loaded static index\n");
             nindex_static.print_stats();
         } else {
-            LOG_INF("Failed to load static index from %s\n", idx_params.load_index.c_str());
+            LOG_INF("Failed to load static index from %s\n", INDEX_PATH.c_str());
         }
+
+        nindex_static.print_stats();
     }
     
     // Initialize performance metrics
@@ -290,7 +273,7 @@ int main(int argc, char** argv) {
                     // Update n-gram index with the newly accepted token
                     const int64_t t_start_draft_us = ggml_time_us();
                     // Add the new token to the index (context now includes the new token)
-                    nindex.add_token(inp.data(), inp.size());
+                    // nindex.add_token(inp.data(), inp.size());
                     t_draft_us += ggml_time_us() - t_start_draft_us;
                 }
                 
@@ -317,7 +300,7 @@ int main(int argc, char** argv) {
                 // Update n-gram index with the newly accepted token
                 const int64_t t_start_draft_us = ggml_time_us();
                 // Add the new token to the index (context now includes the new token)
-                nindex.add_token(inp.data(), inp.size());
+                //nindex.add_token(inp.data(), inp.size());
                 t_draft_us += ggml_time_us() - t_start_draft_us;
             }
             break;
@@ -348,23 +331,11 @@ int main(int argc, char** argv) {
         // If no tokens were drafted from the main index and static index is loaded, try it
         if (n_drafted_tokens == 0 && static_index_loaded) {
             n_drafted_tokens = nindex_static.draft(inp, draft, n_draft);
+            if (n_drafted_tokens > 0) {
+                LOG_INF("0505 Check: Drafted %d tokens from static index\n", n_drafted_tokens);
+            }
         }
-        
-        // // Fallback to simple pair lookup if no drafts from indices
-        // if (n_drafted_tokens == 0 && vp_tokens.size() > 0) {
-        //     int last_token_id = inp.back();
-        //     for (size_t i = 0; i < vp_tokens.size() - 1; i += 2) {
-        //         // Check if this is a key token that matches our input token
-        //         if (vp_tokens[i] == last_token_id) { 
-        //             // Found the key, now insert the NEXT token (the value) into the draft
-        //             // This is always at position i+1 since tokens are stored as key-value pairs
-        //             draft.push_back(vp_tokens[i + 1]);
-        //             n_drafted_tokens = 1;
-        //             break;
-        //         }
-        //     }
-        // }
-        
+                
         t_draft_us += ggml_time_us() - t_start_draft_us;
         n_drafted += draft.size() - 1;
         
@@ -412,6 +383,7 @@ int main(int argc, char** argv) {
     
     LOG_INF("0420 Check: len is %d, n_accept_list = %s\n", (int)n_accept_list.size(), accept_list_str.c_str());
     LOG_INF("0420 Check: accept length average      = %.3f\n", average);
+    LOG_INF("0505 Check: add_token is not used -> nindex is not updated; but nindex_static is used\n");
     LOG_INF("0428 Check: no draft is suppiled forward times = %d\n", n_no_draft_forward);
     
     LOG_INF("\n");
