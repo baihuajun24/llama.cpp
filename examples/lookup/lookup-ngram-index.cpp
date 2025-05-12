@@ -56,6 +56,12 @@ static bool parse_params(int argc, char** argv, common_params& params, ngram_ind
             LOG_ERR("Invalid NGRAM_MAX value in environment: %s\n", env_max);
         }
     }
+
+    // Add this near the other environment variable checks
+    if (const char* env_index_file = std::getenv("INDEX_FILE")) {
+        idx_params.index_file = env_index_file;
+        LOG_INF("Using INDEX_FILE=%s from environment variable\n", idx_params.index_file.c_str());
+    }
     
     // Process command line arguments
     for (int i = 1; i < argc; i++) {
@@ -158,17 +164,28 @@ int main(int argc, char** argv) {
     // 0505 testing: HARDCODE for now
     bool static_index_loaded = true;
     if (static_index_loaded) {
-        std::string INDEX_PATH = "/Users/baihuajun/Documents/llama.cpp/ngram-spec/cache/ngram_index.bin";
-        LOG_INF("Loading static index from %s\n", INDEX_PATH.c_str());
-        static_index_loaded = nindex_static.load(INDEX_PATH);
-        if (static_index_loaded) {
-            LOG_INF("Successfully loaded static index\n");
-            nindex_static.print_stats();
+        std::string INDEX_PATH;
+        
+        // If index_file is provided via command line, use it
+        if (!idx_params.index_file.empty()) {
+            INDEX_PATH = idx_params.index_file;
         } else {
-            LOG_INF("Failed to load static index from %s\n", INDEX_PATH.c_str());
+            // print a msg and throw an error
+            LOG_INF("No index file provided via command line\n");
+            // throw std::runtime_error("No index file provided via command line");
+            // Default fallback paths
+            #ifdef _WIN32
+                INDEX_PATH = "C:\\Users\\Administrator\\Documents\\ngram-spec\\cache\\llama3_magpie_info_50k.bin"; // Default for Windows
+            #else
+                INDEX_PATH = "/Users/baihuajun/Documents/llama.cpp/ngram-spec/cache/llama3_magpie_info_50k.bin"; // Default for Mac/Linux
+            #endif
         }
-
+        
+        LOG_INF("Loading static n-gram index from %s", INDEX_PATH.c_str());
+        
+        static_index_loaded = nindex_static.load(INDEX_PATH);
         nindex_static.print_stats();
+
     }
     
     // Initialize performance metrics
@@ -363,6 +380,30 @@ int main(int argc, char** argv) {
     
     // Print the n-gram index statistics
     nindex.print_stats();
+
+    // Calculate memory usage for nindex
+    size_t nindex_mem_tokens = nindex.get_prompt_tokens().size() * sizeof(llama_token);
+    size_t nindex_mem_index = nindex.get_index().size() * (sizeof(common_ngram) + sizeof(location_buffer));
+    size_t nindex_mem_total = nindex_mem_tokens + nindex_mem_index + sizeof(NGramIndex);
+    LOG_INF("Memory usage for nindex: %zu KB (Tokens: %zu KB, Index: %zu KB)\n", 
+            nindex_mem_total / 1024, nindex_mem_tokens / 1024, nindex_mem_index / 1024);
+
+    // Declare these variables outside any if blocks, but initialize them to 0
+    size_t static_mem_tokens = 0;
+    size_t static_mem_index = 0;
+    size_t static_mem_total = 0;
+
+    // Print static index stats if loaded
+    if (static_index_loaded) {
+        nindex_static.print_stats();
+        
+        // Calculate memory usage for nindex_static
+        static_mem_tokens = nindex_static.get_prompt_tokens().size() * sizeof(llama_token);
+        static_mem_index = nindex_static.get_index().size() * (sizeof(common_ngram) + sizeof(location_buffer));
+        static_mem_total = static_mem_tokens + static_mem_index + sizeof(NGramIndex);
+        LOG_INF("Memory usage for nindex_static: %zu KB (Tokens: %zu KB, Index: %zu KB)\n", 
+                static_mem_total / 1024, static_mem_tokens / 1024, static_mem_index / 1024);
+    }
     
     // Calculate accept length average
     float sum = 0;
@@ -405,10 +446,24 @@ int main(int argc, char** argv) {
             // First write the statistics as header lines            
             output_file << "# Tokens: " << n_predict << ", Speed: " 
                       << decoding_speed << " t/s, # Forward: " 
-                      << n_accept_list.size() << "\n";
+                      << n_accept_list.size() << ", # No draft forward: " 
+                      << n_no_draft_forward << "\n";
             output_file << "# Accept length average: " << average << "\n";
             output_file << "# Accept length list: " << accept_list_str << "\n";
+
+            // Add memory usage statistics
+            size_t nindex_mem_total = nindex_mem_tokens + nindex_mem_index + sizeof(NGramIndex);
+            output_file << "# Memory for nindex: " << nindex_mem_total / 1024 << " KB (Tokens: " 
+                    << nindex_mem_tokens / 1024 << " KB, Index: " 
+                    << nindex_mem_index / 1024 << " KB)\n";
             
+            if (static_index_loaded) {
+                size_t static_mem_total = static_mem_tokens + static_mem_index + sizeof(NGramIndex);
+                output_file << "# Memory for nindex_static: " << static_mem_total / 1024 << " KB (Tokens: " 
+                        << static_mem_tokens / 1024 << " KB, Index: " 
+                        << static_mem_index / 1024 << " KB)\n";
+            }
+
             // Then write the generated text
             output_file << generated_text.str();
             output_file.close();
