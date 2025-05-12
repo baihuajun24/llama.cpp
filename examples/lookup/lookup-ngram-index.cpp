@@ -36,7 +36,7 @@ static bool parse_params(int argc, char** argv, common_params& params, ngram_ind
     
     // Set default values first
     idx_params.ngram_min = 1;
-    idx_params.ngram_max = 4;
+    idx_params.ngram_max = 3;
     
     // Read from environment variables if set
     if (const char* env_min = std::getenv("NGRAM_MIN")) {
@@ -161,8 +161,8 @@ int main(int argc, char** argv) {
     // if load index is not empty, load the index from file
     NGramIndex nindex_static(idx_params.ngram_min, idx_params.ngram_max);
     
-    // 0505 testing: HARDCODE for now
-    bool static_index_loaded = true;
+    // 0512 testing: HARDCODE for now
+    bool static_index_loaded = false;
     if (static_index_loaded) {
         std::string INDEX_PATH;
         
@@ -237,7 +237,7 @@ int main(int argc, char** argv) {
     int n_drafted = 0;
     int n_accept = 1;
     int n_no_draft_forward = 0;
-    std::vector<int> n_accept_list;
+    std::vector<std::pair<int, int>> verify_list;
     
     int n_past = inp.size();
     bool has_eos = false;
@@ -288,10 +288,10 @@ int main(int argc, char** argv) {
                 inp.push_back(id);
                 {
                     // Update n-gram index with the newly accepted token
-                    const int64_t t_start_draft_us = ggml_time_us();
+                    //const int64_t t_start_draft_us = ggml_time_us();
                     // Add the new token to the index (context now includes the new token)
                     // nindex.add_token(inp.data(), inp.size());
-                    t_draft_us += ggml_time_us() - t_start_draft_us;
+                    // t_draft_us += ggml_time_us() - t_start_draft_us;
                 }
                 
                 if (write_to_file) {
@@ -315,15 +315,14 @@ int main(int argc, char** argv) {
             inp.push_back(id);
             {
                 // Update n-gram index with the newly accepted token
-                const int64_t t_start_draft_us = ggml_time_us();
+                //const int64_t t_start_draft_us = ggml_time_us();
                 // Add the new token to the index (context now includes the new token)
                 //nindex.add_token(inp.data(), inp.size());
-                t_draft_us += ggml_time_us() - t_start_draft_us;
+                //t_draft_us += ggml_time_us() - t_start_draft_us;
             }
             break;
         }
         
-        n_accept_list.push_back(accept_length);
         
         if ((params.n_predict > 0 && n_predict > params.n_predict) || has_eos) {
             break;
@@ -343,17 +342,26 @@ int main(int argc, char** argv) {
         const int64_t t_start_draft_us = ggml_time_us();
         
         // Use the n-gram index to draft tokens
-        int n_drafted_tokens = nindex.draft(inp, draft, n_draft);
+        auto [match_n, n_drafted_tokens] = nindex.draft(inp, draft, n_draft);
         
-        // If no tokens were drafted from the main index and static index is loaded, try it
-        if (n_drafted_tokens == 0 && static_index_loaded) {
-            n_drafted_tokens = nindex_static.draft(inp, draft, n_draft);
-            if (n_drafted_tokens > 0) {
-                LOG_INF("0505 Check: Drafted %d tokens from static index\n", n_drafted_tokens);
-            }
-        }
-                
-        t_draft_us += ggml_time_us() - t_start_draft_us;
+        // 0512 comment this to profile draft() time
+        // if (n_drafted_tokens == 0 && static_index_loaded) {
+        //     auto [static_match_n, static_drafted_tokens] = nindex_static.draft(inp, draft, n_draft);
+        //     n_drafted_tokens = static_drafted_tokens;
+        //     match_n = static_match_n;
+        //     if (n_drafted_tokens > 0) {
+        //         LOG_INF("0505 Check: Drafted %d tokens from static index using %d-gram match\n", 
+        //                 n_drafted_tokens, match_n);
+        //     }
+        // } else if (n_drafted_tokens > 0) {
+        //     LOG_INF("0506 Check: Drafted %d tokens from main index using %d-gram match\n", 
+        //             n_drafted_tokens, match_n);
+        // }
+        
+        // Store the match_n and accept_length for this drafting step
+        verify_list.push_back({match_n, accept_length});
+        
+        t_draft_us += ggml_time_us() - t_start_draft_us;;
         n_drafted += draft.size() - 1;
         
         // Add drafted tokens to the batch for the next forward pass
@@ -407,35 +415,33 @@ int main(int argc, char** argv) {
     
     // Calculate accept length average
     float sum = 0;
-    for (size_t i = 0; i < n_accept_list.size(); i++) {
-        sum += n_accept_list[i];
+    for (size_t i = 0; i < verify_list.size(); i++) {
+        sum += verify_list[i].second; // Access the accept_length part
     }
-    float average = n_accept_list.empty() ? 0 : sum / n_accept_list.size();
+    float average = verify_list.empty() ? 0 : sum / verify_list.size();
     
     // Format the vector as a string
-    std::string accept_list_str = "[";
-    for (size_t i = 0; i < n_accept_list.size(); i++) {
-        accept_list_str += std::to_string(n_accept_list[i]);
-        if (i < n_accept_list.size() - 1) {
-            accept_list_str += ", ";
+    std::string verify_list_str = "[";
+    for (size_t i = 0; i < verify_list.size(); i++) {
+        verify_list_str += "(" + std::to_string(verify_list[i].first) + "," + 
+                          std::to_string(verify_list[i].second) + ")";
+        if (i < verify_list.size() - 1) {
+            verify_list_str += ", ";
         }
     }
-    accept_list_str += "]";
+    verify_list_str += "]";
     
-    LOG_INF("0420 Check: len is %d, n_accept_list = %s\n", (int)n_accept_list.size(), accept_list_str.c_str());
+    LOG_INF("0420 Check: len is %d, verify_list = %s\n", (int)verify_list.size(), verify_list_str.c_str());
     LOG_INF("0420 Check: accept length average      = %.3f\n", average);
     LOG_INF("0505 Check: add_token is not used -> nindex is not updated; but nindex_static is used\n");
     LOG_INF("0428 Check: no draft is suppiled forward times = %d\n", n_no_draft_forward);
     
     LOG_INF("\n");
-    LOG_INF("n_draft      = %d\n", n_draft);
-    LOG_INF("n_predict    = %d\n", n_predict);
-    LOG_INF("n_drafted    = %d\n", n_drafted);
-    LOG_INF("t_draft_flat = %.2f ms\n", t_draft_flat_us*1e-3);
-    LOG_INF("t_draft      = %.2f ms, %.2f us per token, %.2f tokens per second\n",
-            t_draft_us*1e-3, 1.0f*t_draft_us/n_drafted, n_drafted/(1e-6*t_draft_us));
-    LOG_INF("n_accept     = %d\n", n_accept);
-    LOG_INF("accept       = %.3f%%\n", 100.0f * n_accept / n_drafted);
+    LOG_INF("# Tokens: %d, Speed: %.2f t/s, # Forward: %d, # No draft forward: %d\n", 
+            n_predict, decoding_speed, verify_list.size(), n_no_draft_forward);
+    LOG_INF("init index time: t_draft_flat = %.2f ms\n", t_draft_flat_us*1e-3);
+    LOG_INF("average draft time per forward = %.2f us\n", 
+            verify_list.empty() ? 0.0f : (float)t_draft_us/verify_list.size());
     
     // Write to file if requested
     if (write_to_file) {
@@ -446,10 +452,13 @@ int main(int argc, char** argv) {
             // First write the statistics as header lines            
             output_file << "# Tokens: " << n_predict << ", Speed: " 
                       << decoding_speed << " t/s, # Forward: " 
-                      << n_accept_list.size() << ", # No draft forward: " 
+                      << verify_list.size() << ", # No draft forward: " 
                       << n_no_draft_forward << "\n";
             output_file << "# Accept length average: " << average << "\n";
-            output_file << "# Accept length list: " << accept_list_str << "\n";
+            output_file << "# Verify list (match_n, accept_length): " << verify_list_str << "\n";
+            output_file << "# Average draft time per forward: " 
+                        << (verify_list.empty() ? 0.0 : (double)t_draft_us/verify_list.size()) 
+                        << " us\n";
 
             // Add memory usage statistics
             size_t nindex_mem_total = nindex_mem_tokens + nindex_mem_index + sizeof(NGramIndex);

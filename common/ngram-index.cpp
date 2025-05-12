@@ -84,10 +84,10 @@ void NGramIndex::add_token(const llama_token* context, int context_size) {
 }
 
 // Draft tokens based on context
-int NGramIndex::draft(const std::vector<llama_token>& inp, std::vector<llama_token>& draft, int n_draft) {
+std::pair<int, int> NGramIndex::draft(const std::vector<llama_token>& inp, std::vector<llama_token>& draft, int n_draft) {
     // Make sure we have some context and draft has at least one token
     if (inp.empty() || draft.empty() || n_draft <= 0) {
-        return 0;
+        return {0, 0}; // Using brace initialization for pair
     }
     
     // Keep the first token in draft (the previously sampled token)
@@ -131,13 +131,13 @@ int NGramIndex::draft(const std::vector<llama_token>& inp, std::vector<llama_tok
             
             // If we added tokens, return
             if (tokens_added > 0) {
-                return tokens_added;
+                return {n, tokens_added}; // Using brace initialization for pair
             }
         }
     }
     
     // No tokens added
-    return 0;
+    return {0, 0}; // Using brace initialization for pair
 }
 
 // Save the index to a file

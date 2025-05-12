@@ -161,9 +161,10 @@ public:
     * @param inp The context tokens generated so far
     * @param draft The token sequence to draft (expected to initially contain the previously sampled token)
     * @param n_draft Desired number of tokens to add to draft
-    * @return Number of tokens added to draft
+    * @return A pair of (match_n, tokens_added) where match_n is the n-gram size that was matched
+    *         and tokens_added is the number of tokens added to the draft
     */
-    int draft(const std::vector<llama_token>& inp, std::vector<llama_token>& draft, int n_draft);
+    std::pair<int, int> draft(const std::vector<llama_token>& inp, std::vector<llama_token>& draft, int n_draft);
     
     /**
      * Save the index to a file
