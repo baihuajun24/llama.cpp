@@ -167,6 +167,17 @@ public:
     std::pair<int, int> draft(const std::vector<llama_token>& inp, std::vector<llama_token>& draft, int n_draft);
     
     /**
+    * Draft tokens using two indices alternately at each n-gram size
+    * @param static_index The secondary index to use when this index doesn't have a match
+    * @param inp The context tokens generated so far
+    * @param draft The token sequence to draft (expected to initially contain the previously sampled token)
+    * @param n_draft Desired number of tokens to add to draft
+    * @return A pair of (match_n, tokens_added) where match_n is the n-gram size that was matched
+    *         and a bool indicating whether the match came from the static index
+    */
+    std::tuple<int, int, bool> draft_2index(const NGramIndex& static_index, const std::vector<llama_token>& inp, std::vector<llama_token>& draft, int n_draft);
+    
+    /**
      * Save the index to a file
      * @param file_path Path to save the index
      * @return True if successful, false otherwise

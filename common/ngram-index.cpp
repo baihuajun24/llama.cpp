@@ -140,6 +140,95 @@ std::pair<int, int> NGramIndex::draft(const std::vector<llama_token>& inp, std::
     return {0, 0}; // Using brace initialization for pair
 }
 
+// Draft tokens using two indices alternately at each n-gram size
+std::tuple<int, int, bool> NGramIndex::draft_2index(const NGramIndex& static_index, 
+                                                   const std::vector<llama_token>& inp, 
+                                                   std::vector<llama_token>& draft, 
+                                                   int n_draft) {
+    // Make sure we have some context and draft has at least one token
+    if (inp.empty() || draft.empty() || n_draft <= 0) {
+        return {0, 0, false}; // Using brace initialization for tuple
+    }
+    
+    // Keep the first token in draft (the previously sampled token)
+    llama_token first_token = draft[0];
+    
+    // Reset draft to just the first token
+    draft.resize(1);
+    
+    // The total tokens added to draft
+    int tokens_added = 0;
+    bool used_static_index = false;
+    
+    // Try different n-gram sizes, starting from the largest
+    for (int n = std::min((int)inp.size(), ngram_max); n >= ngram_min; --n) {
+        // Skip if we don't have enough tokens for this n-gram size
+        if (n > (int)inp.size()) continue;
+        
+        // Create key from the last n tokens in inp
+        common_ngram key(&inp[inp.size() - n], n);
+        
+        // First try this index
+        auto it = index.find(key);
+        if (it != index.end() && !it->second.empty()) {
+            // Get locations for this n-gram
+            const auto& locations = it->second.get_locations();
+            
+            // Use the most recently added location
+            const auto& loc = locations.back();
+            
+            // The position after the n-gram in prompt_tokens
+            int32_t next_pos = loc.index + n;
+            
+            // Add tokens to the draft until we reach n_draft or the end of prompt_tokens
+            while (tokens_added < n_draft && next_pos < (int32_t)prompt_tokens.size()) {
+                // Get the next token
+                llama_token next_token = prompt_tokens[next_pos++];
+                
+                // Add it to the draft
+                draft.push_back(next_token);
+                tokens_added++;
+            }
+            
+            // If we added tokens, return
+            if (tokens_added > 0) {
+                return {n, tokens_added, false}; // match from this index
+            }
+        }
+        
+        // If not found in this index, try the static index for the same n-gram size
+        auto static_it = static_index.index.find(key);
+        if (static_it != static_index.index.end() && !static_it->second.empty()) {
+            // Get locations for this n-gram
+            const auto& locations = static_it->second.get_locations();
+            
+            // Use the most recently added location
+            const auto& loc = locations.back();
+            
+            // The position after the n-gram in static prompt_tokens
+            int32_t next_pos = loc.index + n;
+            
+            // Add tokens to the draft until we reach n_draft or the end of static prompt_tokens
+            while (tokens_added < n_draft && next_pos < (int32_t)static_index.prompt_tokens.size()) {
+                // Get the next token
+                llama_token next_token = static_index.prompt_tokens[next_pos++];
+                
+                // Add it to the draft
+                draft.push_back(next_token);
+                tokens_added++;
+            }
+            
+            // If we added tokens, return
+            if (tokens_added > 0) {
+                return {n, tokens_added, true}; // match from static index
+            }
+        }
+    }
+    
+    // No tokens added from either index
+    return {0, 0, false};
+}
+
 // Save the index to a file
 bool NGramIndex::save(const std::string& file_path) const {
     std::ofstream file(file_path, std::ios::binary);

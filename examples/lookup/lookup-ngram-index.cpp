@@ -28,7 +28,7 @@ struct ngram_index_params {
     int ngram_min = 1;
     
     // Maximum n-gram size
-    int ngram_max = 4;
+    int ngram_max = 6;
 };
 
 static bool parse_params(int argc, char** argv, common_params& params, ngram_index_params& idx_params) {
@@ -36,7 +36,7 @@ static bool parse_params(int argc, char** argv, common_params& params, ngram_ind
     
     // Set default values first
     idx_params.ngram_min = 1;
-    idx_params.ngram_max = 3;
+    idx_params.ngram_max = 6;
     
     // Read from environment variables if set
     if (const char* env_min = std::getenv("NGRAM_MIN")) {
@@ -162,7 +162,7 @@ int main(int argc, char** argv) {
     NGramIndex nindex_static(idx_params.ngram_min, idx_params.ngram_max);
     
     // 0512 testing: HARDCODE for now
-    bool static_index_loaded = false;
+    bool static_index_loaded = true;
     if (static_index_loaded) {
         std::string INDEX_PATH;
         
@@ -341,22 +341,38 @@ int main(int argc, char** argv) {
         
         const int64_t t_start_draft_us = ggml_time_us();
         
-        // Use the n-gram index to draft tokens
-        auto [match_n, n_drafted_tokens] = nindex.draft(inp, draft, n_draft);
+        // Use the improved draft_2index function that alternates between nindex and nindex_static
+        int match_n = 0;
+        int n_drafted_tokens = 0;
+        bool used_static_index = false;
         
-        // 0512 comment this to profile draft() time
-        // if (n_drafted_tokens == 0 && static_index_loaded) {
-        //     auto [static_match_n, static_drafted_tokens] = nindex_static.draft(inp, draft, n_draft);
-        //     n_drafted_tokens = static_drafted_tokens;
-        //     match_n = static_match_n;
-        //     if (n_drafted_tokens > 0) {
-        //         LOG_INF("0505 Check: Drafted %d tokens from static index using %d-gram match\n", 
-        //                 n_drafted_tokens, match_n);
-        //     }
-        // } else if (n_drafted_tokens > 0) {
-        //     LOG_INF("0506 Check: Drafted %d tokens from main index using %d-gram match\n", 
-        //             n_drafted_tokens, match_n);
-        // }
+        if (static_index_loaded) {
+            // Use the new draft_2index function to alternate between both indices
+            auto [m, tokens, from_static] = nindex.draft_2index(nindex_static, inp, draft, n_draft);
+            match_n = m;
+            n_drafted_tokens = tokens;
+            used_static_index = from_static;
+            
+            if (n_drafted_tokens > 0) {
+                if (used_static_index) {
+                    LOG_INF("0505 Check: Drafted %d tokens from static index using %d-gram match\n", 
+                            n_drafted_tokens, match_n);
+                } else {
+                    LOG_INF("0506 Check: Drafted %d tokens from main index using %d-gram match\n", 
+                            n_drafted_tokens, match_n);
+                }
+            }
+        } else {
+            // Fall back to using just the main index if static index is not loaded
+            auto [m, tokens] = nindex.draft(inp, draft, n_draft);
+            match_n = m;
+            n_drafted_tokens = tokens;
+            
+            if (n_drafted_tokens > 0) {
+                LOG_INF("0506 Check: Drafted %d tokens from main index using %d-gram match\n", 
+                        n_drafted_tokens, match_n);
+            }
+        }
         
         // Store the match_n and accept_length for this drafting step
         verify_list.push_back({match_n, accept_length});
