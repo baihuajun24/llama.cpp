@@ -162,7 +162,7 @@ int main(int argc, char** argv) {
     NGramIndex nindex_static(idx_params.ngram_min, idx_params.ngram_max);
     
     // 0512 testing: HARDCODE for now
-    bool static_index_loaded = true;
+    bool static_index_loaded = false;
     if (static_index_loaded) {
         std::string INDEX_PATH;
         
@@ -235,7 +235,7 @@ int main(int argc, char** argv) {
     // Generation variables
     int n_predict = 0;
     int n_drafted = 0;
-    int n_accept = 1;
+    int n_accept = 0;
     int n_no_draft_forward = 0;
     std::vector<std::pair<int, int>> verify_list;
     
@@ -250,7 +250,10 @@ int main(int argc, char** argv) {
     struct llama_kv_cache_view kvc_view = llama_kv_cache_view_init(ctx, 1);
     
     const auto t_dec_start = ggml_time_us();
-    
+
+    int match_n = 0;
+    int last_match_n = -1;
+
     while (true) {
         // Debug
         if (dump_kv_cache) {
@@ -322,8 +325,7 @@ int main(int argc, char** argv) {
             }
             break;
         }
-        
-        
+
         if ((params.n_predict > 0 && n_predict > params.n_predict) || has_eos) {
             break;
         }
@@ -342,7 +344,8 @@ int main(int argc, char** argv) {
         const int64_t t_start_draft_us = ggml_time_us();
         
         // Use the improved draft_2index function that alternates between nindex and nindex_static
-        int match_n = 0;
+        //int match_n = 0;  // Initialize match_n here - before the drafting occurs
+        last_match_n = match_n;
         int n_drafted_tokens = 0;
         bool used_static_index = false;
         
@@ -374,8 +377,7 @@ int main(int argc, char** argv) {
             }
         }
         
-        // Store the match_n and accept_length for this drafting step
-        verify_list.push_back({match_n, accept_length});
+        verify_list.push_back({last_match_n, accept_length});
         
         t_draft_us += ggml_time_us() - t_start_draft_us;;
         n_drafted += draft.size() - 1;
