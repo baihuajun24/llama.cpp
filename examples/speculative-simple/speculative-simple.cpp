@@ -314,9 +314,14 @@ int main(int argc, char ** argv) {
             output_file << "# Accept length average: " << average << "\n";
             output_file << "# Verify list (match_n, accept_length, draft_time_us, verify_time_us): " << verify_list_str << "\n";
             
-            // Then write the generated text
-            for (const auto& token : prompt_tgt) {
-                output_file << common_token_to_piece(ctx_tgt, token);
+            // Then write the generated text - only the newly generated tokens, not the original prompt
+            // Get the original prompt length
+            int prompt_length = inp.size() - n_predict;
+            
+            // Skip the prompt tokens and only write the generated text
+            // Start from the tokens that were generated, not the original prompt
+            for (size_t i = prompt_length; i < prompt_tgt.size(); i++) {
+                output_file << common_token_to_piece(ctx_tgt, prompt_tgt[i]);
             }
             output_file << common_token_to_piece(ctx_tgt, id_last);
             
