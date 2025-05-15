@@ -9,6 +9,9 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <sstream>
+#include <tuple>
+#include <fstream>
 
 int main(int argc, char ** argv) {
     common_params params;
@@ -100,6 +103,9 @@ int main(int argc, char ** argv) {
     int n_drafted = 0;
     int n_accept  = 0;
 
+    // Add a verification list to track (match_n, accept_length, draft_time, verify_time)
+    std::vector<std::tuple<int, int, int64_t, int64_t>> verify_list;
+
     // used to determine end of generation
     bool has_eos = false;
 
@@ -146,7 +152,10 @@ int main(int argc, char ** argv) {
         // offloaded to a remote device. it doesn't even have to be based on an LLM. instead, it can provide tokens
         // from a cache or lookup tables.
         //
+        const auto t_draft_start = ggml_time_us();
         llama_tokens draft = common_speculative_gen_draft(spec, params_spec, prompt_tgt, id_last);
+        const auto t_draft_end = ggml_time_us();
+        const int64_t draft_time_us = t_draft_end - t_draft_start;
 
         //LOG_DBG("draft: %s\n", string_from(ctx_dft, draft).c_str());
 
@@ -170,18 +179,20 @@ int main(int argc, char ** argv) {
             llama_decode(ctx_tgt, batch_tgt);
         }
 
-        // sample from the full target batch and return the accepted tokens based on the target sampler
-        //
-        // for each token to be accepted, the sampler would have to sample that same token
-        // in such cases, instead of decoding the sampled token as we normally do, we simply continue with the
-        // available logits from the batch and sample the next token until we run out of logits or the sampler
-        // disagrees with the draft
-        //
+        // Sample from the full target batch and return the accepted tokens based on the target sampler
+        const auto t_verify_start = ggml_time_us();
         const auto ids = common_sampler_sample_and_accept_n(smpl, ctx_tgt, draft);
-
+        const auto t_verify_end = ggml_time_us();
+        const int64_t verify_time_us = t_verify_end - t_verify_start;
+        
         //LOG_DBG("ids: %s\n", string_from(ctx_tgt, ids).c_str());
 
         GGML_ASSERT(ids.size() > 0); // there will always be at least one accepted token
+
+        // Record match_n (draft size), accept_length (ids size-1), and verification time
+        int match_n = -1; // default value for spec method
+        int accept_length = ids.size() - 1;
+        verify_list.push_back(std::make_tuple(match_n, accept_length, draft_time_us, verify_time_us));
 
         n_past    += ids.size() - 1;
         n_drafted += draft.size(); // note: we ignore the discarded small drafts
@@ -228,11 +239,35 @@ int main(int argc, char ** argv) {
     auto t_dec_end = ggml_time_us();
 
     const int n_input = inp.size();
+    const float decoding_speed = n_predict / ((t_dec_end - t_dec_start) / 1e6f);
 
     LOG("\n\n");
 
     LOG_INF("encoded %4d tokens in %8.3f seconds, speed: %8.3f t/s\n", n_input,   (t_enc_end - t_enc_start) / 1e6f, inp.size() / ((t_enc_end - t_enc_start) / 1e6f));
-    LOG_INF("decoded %4d tokens in %8.3f seconds, speed: %8.3f t/s\n", n_predict, (t_dec_end - t_dec_start) / 1e6f, n_predict  / ((t_dec_end - t_dec_start) / 1e6f));
+    LOG_INF("decoded %4d tokens in %8.3f seconds, speed: %8.3f t/s\n", n_predict, (t_dec_end - t_dec_start) / 1e6f, decoding_speed);
+
+    // Calculate accept length average
+    float sum = 0;
+    for (size_t i = 0; i < verify_list.size(); i++) {
+        sum += std::get<1>(verify_list[i]); // Access the accept_length part
+    }
+    float average = verify_list.empty() ? 0 : sum / verify_list.size();
+
+    // Format the verify_list as a string
+    std::string verify_list_str = "[";
+    for (size_t i = 0; i < verify_list.size(); i++) {
+        verify_list_str += "(" + std::to_string(std::get<0>(verify_list[i])) + "," + 
+                          std::to_string(std::get<1>(verify_list[i])) + "," +
+                          std::to_string(std::get<2>(verify_list[i])) + "," +
+                          std::to_string(std::get<3>(verify_list[i])) + ")";
+        if (i < verify_list.size() - 1) {
+            verify_list_str += ", ";
+        }
+    }
+    verify_list_str += "]";
+
+    LOG_INF("0420 Check: len is %d, verify_list = %s\n", (int)verify_list.size(), verify_list_str.c_str());
+    LOG_INF("0420 Check: accept length average = %.3f\n", average);
 
     LOG_INF("\n");
     LOG_INF("n_draft   = %d\n", n_draft);
@@ -256,6 +291,40 @@ int main(int argc, char ** argv) {
     llama_backend_free();
 
     LOG("\n\n");
+
+    // For storing generated text
+    std::stringstream generated_text;
+    
+    // Check for environment variable first, then fall back to params.out_file
+    const char* env_output_path = std::getenv("LLAMA_OUTPUT_FILE");
+    std::string output_path = env_output_path != nullptr ? env_output_path : params.out_file;
+    bool write_to_file = !output_path.empty();
+
+    // Write to file if requested
+    if (write_to_file) {
+        std::ofstream output_file(output_path);
+        if (!output_file.is_open()) {
+            LOG_ERR("Failed to open output file: %s\n", output_path.c_str());
+        } else {
+            // Write the statistics as header lines            
+            output_file << "# Tokens: " << n_predict << ", Speed: " 
+                      << decoding_speed << " t/s, # Forward: " 
+                      << verify_list.size() << ", n_draft: "
+                      << params_spec.n_draft << "\n";
+            output_file << "# Accept length average: " << average << "\n";
+            output_file << "# Verify list (match_n, accept_length, draft_time_us, verify_time_us): " << verify_list_str << "\n";
+            
+            // Then write the generated text
+            for (const auto& token : prompt_tgt) {
+                output_file << common_token_to_piece(ctx_tgt, token);
+            }
+            output_file << common_token_to_piece(ctx_tgt, id_last);
+            
+            output_file.close();
+            
+            LOG_INF("Generated text written to: %s\n", output_path.c_str());
+        }
+    }
 
     return 0;
 }
