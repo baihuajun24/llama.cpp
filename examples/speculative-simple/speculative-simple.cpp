@@ -95,7 +95,8 @@ int main(int argc, char ** argv) {
 
     // how many tokens to draft each time
     int n_draft     = params.speculative.n_max;
-    int n_draft_min = params.speculative.n_min;
+    // int n_draft_min = params.speculative.n_min;
+    int n_draft_min = 1;
 
     float p_min = params.speculative.p_min;
 
@@ -103,8 +104,8 @@ int main(int argc, char ** argv) {
     int n_drafted = 0;
     int n_accept  = 0;
 
-    // Add a verification list to track (match_n, accept_length, draft_time, verify_time)
-    std::vector<std::tuple<int, int, int64_t, int64_t>> verify_list;
+    // Add a verification list to track (match_n, accept_length, draft_size, draft_time, verify_time)
+    std::vector<std::tuple<int, int, int64_t, int64_t, int64_t>> verify_list;
 
     // used to determine end of generation
     bool has_eos = false;
@@ -192,7 +193,7 @@ int main(int argc, char ** argv) {
         // Record match_n (draft size), accept_length (ids size-1), and verification time
         int match_n = -1; // default value for spec method
         int accept_length = ids.size() - 1;
-        verify_list.push_back(std::make_tuple(match_n, accept_length, draft_time_us, verify_time_us));
+        verify_list.push_back(std::make_tuple(match_n, accept_length, draft.size(), draft_time_us, verify_time_us));
 
         n_past    += ids.size() - 1;
         n_drafted += draft.size(); // note: we ignore the discarded small drafts
@@ -259,7 +260,8 @@ int main(int argc, char ** argv) {
         verify_list_str += "(" + std::to_string(std::get<0>(verify_list[i])) + "," + 
                           std::to_string(std::get<1>(verify_list[i])) + "," +
                           std::to_string(std::get<2>(verify_list[i])) + "," +
-                          std::to_string(std::get<3>(verify_list[i])) + ")";
+                          std::to_string(std::get<3>(verify_list[i])) + "," +
+                          std::to_string(std::get<4>(verify_list[i])) + ")";
         if (i < verify_list.size() - 1) {
             verify_list_str += ", ";
         }
@@ -275,6 +277,14 @@ int main(int argc, char ** argv) {
     LOG_INF("n_drafted = %d\n", n_drafted);
     LOG_INF("n_accept  = %d\n", n_accept);
     LOG_INF("accept    = %.3f%%\n", 100.0f * n_accept / n_drafted);
+
+    // Calculate average draft size
+    float total_draft_size = 0;
+    for (const auto& item : verify_list) {
+        total_draft_size += std::get<2>(item);
+    }
+    float avg_draft_size = verify_list.empty() ? 0 : total_draft_size / verify_list.size();
+    LOG_INF("avg_draft_size = %.3f\n", avg_draft_size);
 
     LOG_INF("\n");
     LOG_INF("draft:\n\n");
@@ -312,7 +322,7 @@ int main(int argc, char ** argv) {
                       << verify_list.size() << ", n_draft: "
                       << params_spec.n_draft << "\n";
             output_file << "# Accept length average: " << average << "\n";
-            output_file << "# Verify list (match_n, accept_length, draft_time_us, verify_time_us): " << verify_list_str << "\n";
+            output_file << "# Verify list (match_n, accept_length, draft_size, draft_time_us, verify_time_us): " << verify_list_str << "\n";
             
             // Then write the generated text - only the newly generated tokens, not the original prompt
             // Get the original prompt length
