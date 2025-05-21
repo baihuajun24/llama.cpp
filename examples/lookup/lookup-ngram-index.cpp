@@ -253,6 +253,10 @@ int main(int argc, char** argv) {
 
     int match_n = 0;
     int last_match_n = -1;
+    std::vector<llama_token> last_match_n_tokens;
+
+    // Add this near the top with other variable declarations, before the main loop
+    std::stringstream match_log_buffer;
 
     while (true) {
         // Debug
@@ -308,7 +312,7 @@ int main(int argc, char** argv) {
                     // LOG_INF("[Check] no draft caused accept length = %d\n", accept_length);
                 }
             }
-            
+
             if (write_to_file) {
                 generated_text << token_str;
             }
@@ -320,7 +324,7 @@ int main(int argc, char** argv) {
                 // Update n-gram index with the newly accepted token
                 //const int64_t t_start_draft_us = ggml_time_us();
                 // Add the new token to the index (context now includes the new token)
-                //nindex.add_token(inp.data(), inp.size());
+                // nindex.add_token(inp.data(), inp.size());
                 //t_draft_us += ggml_time_us() - t_start_draft_us;
             }
             break;
@@ -367,18 +371,45 @@ int main(int argc, char** argv) {
             }
         } else {
             // Fall back to using just the main index if static index is not loaded
+            // use a variable to store last match_n elements of inp
+            // rest the last_match_n_tokens
+            last_match_n_tokens.clear();
+            for (int i = std::max(0, (int)inp.size() - last_match_n); i < (int)inp.size(); i++) {
+                last_match_n_tokens.push_back(inp[i]);
+            }
             auto [m, tokens] = nindex.draft(inp, draft, n_draft);
             match_n = m;
             n_drafted_tokens = tokens;
             
-            if (n_drafted_tokens > 0) {
-                LOG_INF("0506 Check: Drafted %d tokens from main index using %d-gram match\n", 
-                        n_drafted_tokens, match_n);
-            }
+            // if (n_drafted_tokens > 0) {
+            //     LOG_INF("0506 Check: Drafted %d tokens from main index using %d-gram match\n", 
+            //             n_drafted_tokens, match_n);
+            // }
+
         }
         
         verify_list.push_back({last_match_n, accept_length});
-        
+
+        if (accept_length > 1) {
+            // Create a formatted message for the match info
+            std::ostringstream match_info;
+            match_info << "[last_match_n = " << last_match_n << " -> accept_length = " << accept_length << "] matched: ";
+            for (int i = 0; i < last_match_n_tokens.size(); i++) {
+                match_info << last_match_n_tokens[i] << " ";
+            }
+            match_info << ";answer: ";
+            for (int i = std::max(0, (int)draft.size() - accept_length); i < (int)draft.size(); i++) {
+                match_info << draft[i] << " ";
+            }
+            match_info << "\n";
+            
+            // Log to console (keep this if you want console output too)
+            LOG_INF("%s", match_info.str().c_str());
+            
+            // Add to the buffer for file output
+            match_log_buffer << match_info.str();
+        }
+
         t_draft_us += ggml_time_us() - t_start_draft_us;;
         n_drafted += draft.size() - 1;
         
@@ -451,7 +482,7 @@ int main(int argc, char** argv) {
     
     LOG_INF("0420 Check: len is %d, verify_list = %s\n", (int)verify_list.size(), verify_list_str.c_str());
     LOG_INF("0420 Check: accept length average      = %.3f\n", average);
-    LOG_INF("0505 Check: add_token is not used -> nindex is not updated; but nindex_static is used\n");
+    LOG_INF("0505 Check: add_token is not used \n");
     LOG_INF("0428 Check: no draft is suppiled forward times = %d\n", n_no_draft_forward);
     
     LOG_INF("\n");
@@ -491,8 +522,92 @@ int main(int argc, char** argv) {
                         << static_mem_index / 1024 << " KB)\n";
             }
 
+            // Add the detailed match logs section
+            output_file << "\n# Detailed Match Information:\n";
+            output_file << match_log_buffer.str();
+            
+            // Add a separator before the generated text
+            output_file << "\n# Generated Text:\n";
+
             // Then write the generated text
             output_file << generated_text.str();
+            
+            // Add the new Raw Token IDs section
+            output_file << "\n\n# Raw Token IDs:\n";
+            
+            // Calculate the original prompt length
+            int prompt_length = n_input;
+            
+            // Write prompt token IDs in a single line
+            output_file << "# Prompt tokens (0-" << (prompt_length-1) << "):\n";
+            for (int i = 0; i < prompt_length; i++) {
+                output_file << inp[i];
+                if (i < prompt_length - 1) {
+                    output_file << " ";
+                }
+                
+                // Add line breaks every 20 tokens for readability
+                if ((i + 1) % 20 == 0 && i < prompt_length - 1) {
+                    output_file << "\n";
+                }
+            }
+            output_file << "\n\n";
+            
+            // Write generated token IDs in a single line
+            output_file << "# Generated tokens (" << prompt_length << "-" << (inp.size()-1) << "):\n";
+            for (int i = prompt_length; i < (int)inp.size(); i++) {
+                output_file << inp[i];
+                if (i < inp.size() - 1) {
+                    output_file << " ";
+                }
+            }
+            output_file << "\n";
+            
+            // Add the detailed All Tokens section
+            output_file << "\n# All Tokens:\n";
+            
+            // Write token IDs with formatting to distinguish prompt from generated text
+            output_file << "# Format: [token_index] token_id  (token_text)\n";
+            output_file << "# Prompt tokens (0-" << (prompt_length-1) << "):\n";
+            
+            // Write prompt tokens with indices
+            for (int i = 0; i < prompt_length; i++) {
+                // Get the token text representation
+                std::string token_text = common_token_to_piece(ctx, inp[i]);
+                // Escape any newlines or other special characters in the token text
+                std::string escaped_text = token_text;
+                // Simple escaping for common problematic characters
+                size_t pos = 0;
+                while((pos = escaped_text.find('\n', pos)) != std::string::npos) {
+                    escaped_text.replace(pos, 1, "\\n");
+                    pos += 2;
+                }
+                
+                // Write token with index, ID, and text
+                output_file << "[" << std::setw(4) << i << "] " << std::setw(6) << inp[i] 
+                           << "  (" << escaped_text << ")\n";
+            }
+            
+            // Write generated tokens with indices
+            output_file << "\n# Generated tokens (" << prompt_length << "-" << (inp.size()-1) << "):\n";
+            for (int i = prompt_length; i < (int)inp.size(); i++) {
+                // Get the token text representation
+                std::string token_text = common_token_to_piece(ctx, inp[i]);
+                // Escape any newlines or other special characters in the token text
+                std::string escaped_text = token_text;
+                // Simple escaping for common problematic characters
+                size_t pos = 0;
+                while((pos = escaped_text.find('\n', pos)) != std::string::npos) {
+                    escaped_text.replace(pos, 1, "\\n");
+                    pos += 2;
+                }
+                
+                // Write token with index, ID, and text
+                output_file << "[" << std::setw(4) << i << "] " << std::setw(6) << inp[i] 
+                           << "  (" << escaped_text << ")\n";
+            }
+            
+            // Close the file
             output_file.close();
             
             LOG_INF("Generated text written to: %s\n", params.out_file.c_str());
