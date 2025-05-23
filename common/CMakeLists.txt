@@ -73,6 +73,8 @@ add_library(${TARGET} STATIC
     ngram-cache.h
     ngram-index.cpp  
     ngram-index.h
+    ngram-table.cpp
+    ngram-table.h
     rest-index.h
     rest-index.cpp
     sampling.cpp
