@@ -1,9 +1,12 @@
-cmake_minimum_required(VERSION 3.18)  # for CMAKE_CUDA_ARCHITECTURES
+cmake_minimum_required(VERSION 3.16)  # for CMAKE_CUDA_ARCHITECTURES # updated on 0527
 
-find_package(CUDAToolkit)
+# find_package(CUDAToolkit)
 
-if (CUDAToolkit_FOUND)
-    message(STATUS "CUDA Toolkit found")
+# if (CUDAToolkit_FOUND)
+#     message(STATUS "CUDA Toolkit found")
+
+enable_language(CUDA)
+message(STATUS "Enabled CUDA language")
 
     if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
         # native == GPUs available at build time
@@ -80,23 +83,35 @@ if (CUDAToolkit_FOUND)
     if (GGML_CUDA_NO_PEER_COPY)
         add_compile_definitions(GGML_CUDA_NO_PEER_COPY)
     endif()
+    
+    # Set default CUDA library directory
+    if(NOT DEFINED CUDA_HOME)
+        set(CUDA_HOME "/usr/local/cuda")
+    endif()
 
-    if (GGML_STATIC)
-        if (WIN32)
-            # As of 12.3.1 CUDA Toolkit for Windows does not offer a static cublas library
-            target_link_libraries(ggml-cuda PRIVATE CUDA::cudart_static CUDA::cublas CUDA::cublasLt)
-        else ()
-            target_link_libraries(ggml-cuda PRIVATE  CUDA::cudart_static CUDA::cublas_static CUDA::cublasLt_static)
+    # Include headers and libraries
+    include_directories(${CUDA_HOME}/include)
+    link_directories(${CUDA_HOME}/lib64)
+
+    # Link CUDA libraries
+    if(GGML_STATIC)
+        # Statically link libraries where available (not all platforms support static linking of all CUDA libs)
+        if(WIN32)
+            message(WARNING "Static linking of cublas is not supported on Windows CUDA 12.3.1+; using dynamic linking fallback.")
+            target_link_libraries(ggml-cuda PRIVATE cudart cublas cublasLt)
+        else()
+            target_link_libraries(ggml-cuda PRIVATE cudart_static cublas_static cublasLt_static)
         endif()
     else()
-        target_link_libraries(ggml-cuda PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt)
+        # Dynamic linking (default)
+        target_link_libraries(ggml-cuda PRIVATE cudart cublas cublasLt)
     endif()
 
-    if (GGML_CUDA_NO_VMM)
-        # No VMM requested, no need to link directly with the cuda driver lib (libcuda.so)
-    else()
-        target_link_libraries(ggml-cuda PRIVATE CUDA::cuda_driver)
+    # Optionally link against the CUDA driver API (libcuda.so), unless disabled
+    if(NOT GGML_CUDA_NO_VMM)
+        target_link_libraries(ggml-cuda PRIVATE cuda)
     endif()
+
 
     set(CUDA_CXX_FLAGS "")
 
@@ -160,6 +175,6 @@ if (CUDAToolkit_FOUND)
     endif()
 
     target_compile_options(ggml-cuda PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>")
-else()
-    message(FATAL_ERROR "CUDA Toolkit not found")
-endif()
+# else()
+#     message(FATAL_ERROR "CUDA Toolkit not found")
+# endif()
