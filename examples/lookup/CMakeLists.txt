@@ -42,6 +42,13 @@ install(TARGETS ${TARGET_NGRAM_TABLE} RUNTIME)
 target_link_libraries(${TARGET_NGRAM_TABLE} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET_NGRAM_TABLE} PRIVATE cxx_std_17)
 
+# Add the new pld-search executable
+set(TARGET_NGRAM_TABLE llama-lookup-pld-search)
+add_executable(${TARGET_NGRAM_TABLE} pld-search.cpp)
+install(TARGETS ${TARGET_NGRAM_TABLE} RUNTIME)
+target_link_libraries(${TARGET_NGRAM_TABLE} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET_NGRAM_TABLE} PRIVATE cxx_std_17)
+
 # --- Skip building build-ngram-index (temporary) ---
 # set(TARGET_BUILD_NGRAM_INDEX build-ngram-index)
 # add_executable(${TARGET_BUILD_NGRAM_INDEX} build-ngram-index.cpp)

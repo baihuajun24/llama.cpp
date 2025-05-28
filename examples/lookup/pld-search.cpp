@@ -1,7 +1,6 @@
 #include "arg.h"
 #include "ggml.h"
 #include "common.h"
-#include "ngram-cache.h"
 #include "sampling.h"
 #include "log.h"
 #include "llama.h"
@@ -11,29 +10,96 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include <unordered_map>
+#include <random>
 
-// Find prior occurrence of n-grams in inp and draft up to n_draft tokens
+// Base version
+// void common_ngram_cache_draft(const std::vector<llama_token> & inp,
+//                                std::vector<llama_token> & draft,
+//                                int n_draft,
+//                                int ngram_min,
+//                                int ngram_max) {
+
+//     const int inp_size = inp.size();
+//     LOG_INF("[draft] inp_size = %d, n_draft = %d, ngram_min = %d, ngram_max = %d\n", inp_size, n_draft, ngram_min, ngram_max);
+
+//     if (inp_size < ngram_min) {
+//         LOG_INF("[draft] Early return: inp_size < ngram_min\n");
+//         return;
+//     }
+
+//     const int max_n = std::min(ngram_max, inp_size);
+//     LOG_INF("[draft] max_n = %d\n", max_n);
+
+//     for (int n = max_n; n >= ngram_min; --n) {
+//         const int start_pos = inp_size - n;
+//         LOG_INF("[draft] Trying n = %d, start_pos = %d\n", n, start_pos);
+
+//         std::vector<llama_token> suffix(inp.begin() + start_pos, inp.end());
+
+//         LOG_INF("[draft] Suffix:");
+//         for (auto t : suffix) {
+//             LOG_INF(" %d", t);
+//         }
+//         LOG_INF("\n");
+
+//         for (int i = 0; i < start_pos; ++i) {
+//             bool match = true;
+//             for (int j = 0; j < n; ++j) {
+//                 if (inp[i + j] != suffix[j]) {
+//                     match = false;
+//                     break;
+//                 }
+//             }
+
+//             if (match) {
+//                 LOG_INF("[draft] Match found at i = %d for n = %d\n", i, n);
+//                 int collected = 0;
+//                 for (int j = 0; j < n_draft && (i + n + j) < inp_size; ++j) {
+//                     llama_token token = inp[i + n + j];
+//                     draft.push_back(token);
+//                     LOG_INF("[draft] Drafted token[%d] = %d\n", j, token);
+//                     collected++;
+//                 }
+//                 LOG_INF("[draft] Total %d tokens drafted\n", collected);
+//                 return;
+//             }
+//         }
+//     }
+
+//     LOG_INF("[draft] No match found, draft remains empty\n");
+// }
+
 void common_ngram_cache_draft(const std::vector<llama_token> & inp,
                                std::vector<llama_token> & draft,
                                int n_draft,
                                int ngram_min,
                                int ngram_max) {
-    draft.clear();
-
+                                
     const int inp_size = inp.size();
+    LOG_INF("[draft] inp_size = %d, n_draft = %d, ngram_min = %d, ngram_max = %d\n", inp_size, n_draft, ngram_min, ngram_max);
+
     if (inp_size < ngram_min) {
+        LOG_INF("[draft] Early return: inp_size < ngram_min\n");
         return;
     }
 
     const int max_n = std::min(ngram_max, inp_size);
+    LOG_INF("[draft] max_n = %d\n", max_n);
 
-    // Start from longest possible match down to ngram_min
+    std::unordered_map<llama_token, int> freq;
+    std::unordered_map<llama_token, std::vector<int>> indices;
+
     for (int n = max_n; n >= ngram_min; --n) {
         const int start_pos = inp_size - n;
         std::vector<llama_token> suffix(inp.begin() + start_pos, inp.end());
 
-        // Scan backwards through inp to find a previous match
-        for (int i = 0; i <= inp_size - n - n_draft; ++i) {
+        LOG_INF("[draft] Trying n = %d, start_pos = %d\n", n, start_pos);
+        LOG_INF("[draft] Suffix:");
+        for (auto t : suffix) LOG_INF(" %d", t);
+        LOG_INF("\n");
+
+        for (int i = 0; i < start_pos; ++i) {
             bool match = true;
             for (int j = 0; j < n; ++j) {
                 if (inp[i + j] != suffix[j]) {
@@ -42,17 +108,57 @@ void common_ngram_cache_draft(const std::vector<llama_token> & inp,
                 }
             }
 
-            if (match) {
-                // We found a matching n-gram, now collect n_draft tokens after it
-                for (int j = 0; j < n_draft; ++j) {
-                    draft.push_back(inp[i + n + j]);
-                }
-                return;  // Exit after first match
+            if (match && (i + n) < inp_size) {
+                llama_token next_token = inp[i + n];
+                freq[next_token]++;
+                indices[next_token].push_back(i + n);  // record the starting index of continuation
+
+                LOG_INF("[draft] Match at i = %d: first draft token = %d, freq = %d\n",
+                        i, next_token, freq[next_token]);
             }
+        }
+
+        if (!freq.empty()) break;  // stop early once we get candidates for some n
+    }
+
+    if (freq.empty()) {
+        LOG_INF("[draft] No match found, draft remains empty\n");
+        return;
+    }
+
+    // Find the most frequent first token(s)
+    int max_freq = 0;
+    std::vector<llama_token> top_tokens;
+    for (const auto &kv : freq) {
+        if (kv.second > max_freq) {
+            max_freq = kv.second;
+            top_tokens.clear();
+            top_tokens.push_back(kv.first);
+        } else if (kv.second == max_freq) {
+            top_tokens.push_back(kv.first);
+        }
+    }
+
+    // Random tie-breaking
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(0, top_tokens.size() - 1);
+    llama_token chosen_token = top_tokens[dis(gen)];
+
+    LOG_INF("[draft] Chosen first token = %d with freq = %d\n", chosen_token, max_freq);
+
+    // Randomly select one of the continuation indices for the chosen token
+    const std::vector<int>& starts = indices[chosen_token];
+    if (!starts.empty()) {
+        std::uniform_int_distribution<> dis2(0, starts.size() - 1);
+        int chosen_start = starts[dis2(gen)];
+
+        for (int j = 0; j < n_draft && (chosen_start + j) < inp_size; ++j) {
+            draft.push_back(inp[chosen_start + j]);
+            LOG_INF("[draft] Final drafted token[%d] = %d\n", j, inp[chosen_start + j]);
         }
     }
 }
-
 
 int main(int argc, char ** argv){
     common_params params;
