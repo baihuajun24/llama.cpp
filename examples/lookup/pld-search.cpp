@@ -158,7 +158,7 @@ int common_ngram_cache_draft(const std::vector<llama_token> & search_space,
 
 std::vector<llama_token> load_static_token_cache() {
     LOG_INF("[0528 start load_static_token_cache]");
-    const std::string file_path = "/group/ossdphi_algo_scratch_11/huajubai/ngram-spec/ngram-spec/outputs/code/magpie-code-tokens.bin";
+    const std::string file_path = "C:/Users/Administrator/Documents/ngram-spec/outputs/code/magpie-code-tokens.bin";
     std::ifstream file(file_path, std::ios::binary);
 
     if (!file.is_open()) {
