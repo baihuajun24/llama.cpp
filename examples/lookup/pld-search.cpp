@@ -16,7 +16,7 @@
 #include <iostream>
 #include <iomanip>  // for std::fixed, std::setprecision
 
-// Base version
+// Base version // don't do draft.clear() !!!!
 int common_ngram_cache_draft(const std::vector<llama_token> & search_space,
                               const std::vector<llama_token> & match_key,
                               std::vector<llama_token> & draft,
@@ -46,15 +46,6 @@ int common_ngram_cache_draft(const std::vector<llama_token> & search_space,
             }
 
             if (match) {
-                // Print the matched region
-                // std::string matched_region = "[";
-                // for (int j = 0; j < n; ++j) {
-                //     matched_region += std::to_string(search_space[i + j]);
-                //     if (j < n - 1) matched_region += ", ";
-                // }
-                // matched_region += "]";
-                // LOG_INF("[PLD match] Match found at index %d, length %d, token ids: %s\n", i, n, matched_region.c_str());
-
                 // Draft up to n_draft tokens after the match
                 for (int j = 0; j < n_draft && (i + n + j) < search_size; ++j) {
                     draft.push_back(search_space[i + n + j]);
@@ -69,96 +60,254 @@ int common_ngram_cache_draft(const std::vector<llama_token> & search_space,
 }
 
 
+// Advanced version with frequency-based ranking
+// Helper function to select best candidate based on token frequency ranking
+std::vector<llama_token> select_best_candidate(const std::vector<llama_token>& search_space,
+                                             const std::vector<int>& match_positions,
+                                             int n,
+                                             int n_draft) {
+    if (match_positions.empty()) {
+        return {};
+    }
 
+    const int search_size = search_space.size();
+    
+    // Find valid match positions (those with at least one continuation token)
+    std::vector<std::pair<int, int>> extend_match_positions; // [pos, count]
+    for (int pos : match_positions) {
+        if (pos + n < search_size) {
+            extend_match_positions.push_back({pos, 0}); // count will be updated
+        }
+    }
 
-// don't do draft.clear() !!!!
-// This have some problems for draft[0] = 475
-// int common_ngram_cache_draft(const std::vector<llama_token> & inp,
-//                               std::vector<llama_token> & draft,
-//                               int n_draft,
-//                               int ngram_min,
-//                               int ngram_max) {
-//     const int inp_size = inp.size();
-//     if (inp_size < ngram_min) {
-//         return 0;
-//     }
+    if (extend_match_positions.empty()) {
+        return {};
+    }
 
-//     const int max_n = std::min(ngram_max, inp_size);
-//     std::unordered_map<llama_token, int> freq;
-//     std::unordered_map<llama_token, std::vector<int>> indices;
+    if (extend_match_positions.size() == 1) {
+        // Single candidate, extract directly
+        std::vector<llama_token> result;
+        int pos = extend_match_positions[0].first;
+        for (int j = 0; j < n_draft && (pos + n + j) < search_size; ++j) {
+            result.push_back(search_space[pos + n + j]);
+        }
+        return result;
+    }
 
-//     int final_match_n = 0;
+    // Iteratively filter by token frequency at each position
+    for (int offset = 1; offset <= n_draft && extend_match_positions.size() > 1; ++offset) {
+        // Count frequency of tokens at current offset position
+        std::unordered_map<llama_token, int> token_freq;
+        
+        for (auto& pair : extend_match_positions) {
+            int pos = pair.first;
+            int actual_pos = pos + n + offset - 1; // offset-1 because we start from offset=1
+            if (actual_pos < search_size) {
+                token_freq[search_space[actual_pos]]++;
+            }
+        }
 
-//     for (int n = max_n; n >= ngram_min; --n) {
-//         const int start_pos = inp_size - n;
-//         std::vector<llama_token> suffix(inp.begin() + start_pos, inp.end());
+        if (token_freq.empty()) {
+            break; // No more tokens to compare
+        }
 
-//         for (int i = 0; i < start_pos; ++i) {
-//             bool match = true;
-//             for (int j = 0; j < n; ++j) {
-//                 if (inp[i + j] != suffix[j]) {
-//                     match = false;
-//                     break;
-//                 }
-//             }
+        // Update counts in extend_match_positions
+        for (auto& pair : extend_match_positions) {
+            int pos = pair.first;
+            int actual_pos = pos + n + offset - 1;
+            if (actual_pos < search_size) {
+                pair.second = token_freq[search_space[actual_pos]];
+            } else {
+                pair.second = 0; // No token at this position
+            }
+        }
 
-//             if (match && (i + n) < inp_size) {
-//                 llama_token next_token = inp[i + n];
-//                 freq[next_token]++;
-//                 indices[next_token].push_back(i + n);  // points to next_token
-//                 final_match_n = n;
-//             }
-//         }
+        // Find the maximum frequency (1st place)
+        int max_freq = 0;
+        for (const auto& pair : extend_match_positions) {
+            max_freq = std::max(max_freq, pair.second);
+        }
 
-//         if (!freq.empty()) break;  // stop at first n with matches
-//     }
+        // Remove all non-1st items (keep only those with max frequency)
+        std::vector<std::pair<int, int>> filtered_positions;
+        for (const auto& pair : extend_match_positions) {
+            if (pair.second == max_freq) {
+                filtered_positions.push_back(pair);
+            }
+        }
 
-//     if (freq.empty()) {
-//         return 0;
-//     }
+        extend_match_positions = filtered_positions;
+    }
 
-//     // Optional: Log frequencies for debugging
-//     for (const auto& [token, count] : freq) {
-//         LOG_INF("[draft] Token %d frequency = %d\n", token, count);
-//     }
+    // Extract result from the single remaining position
+    if (!extend_match_positions.empty()) {
+        int single_pos_left = extend_match_positions[0].first;
+        std::vector<llama_token> result;
+        for (int j = 0; j < n_draft && (single_pos_left + n + j) < search_size; ++j) {
+            result.push_back(search_space[single_pos_left + n + j]);
+        }
+        return result;
+    }
+    // Fallback (should not reach here)
+    return {};
+}
 
-//     // Find top tokens by frequency
-//     int max_freq = 0;
-//     std::vector<llama_token> top_tokens;
-//     for (const auto &kv : freq) {
-//         if (kv.second > max_freq) {
-//             max_freq = kv.second;
-//             top_tokens.clear();
-//             top_tokens.push_back(kv.first);
-//         } else if (kv.second == max_freq) {
-//             top_tokens.push_back(kv.first);
-//         }
-//     }
+int common_ngram_cache_draft_advanced(const std::vector<llama_token> & search_space,
+                                    const std::vector<llama_token> & match_key,
+                                    std::vector<llama_token> & draft,
+                                    int n_draft,
+                                    int ngram_min,
+                                    int ngram_max) {
+    const int search_size = search_space.size();
+    const int match_size = match_key.size();
 
-//     std::random_device rd;
-//     std::mt19937 gen(rd());
-//     std::uniform_int_distribution<> dis(0, top_tokens.size() - 1);
-//     llama_token chosen_token = top_tokens[dis(gen)];
+    if (match_size < ngram_min || search_size < ngram_min) {
+        return 0;
+    }
 
-//     const std::vector<int>& starts = indices[chosen_token];
-//     if (!starts.empty()) {
-//         std::uniform_int_distribution<> dis2(0, starts.size() - 1);
-//         int chosen_start = starts[dis2(gen)];  // points to chosen_token
+    const int max_n = std::min(ngram_max, match_size);
 
-//         // Add chosen_token and n_draft - 1 continuation tokens
-//         for (int j = 0; j < n_draft && (chosen_start + j) < inp_size; ++j) {
-//             draft.push_back(inp[chosen_start + j]);
-//             LOG_INF("[draft] Final drafted token[%d] = %d\n", j, inp[chosen_start + j]);
-//         }
-//     }
+    for (int n = max_n; n >= ngram_min; --n) {
+        // Take the last n tokens of match_key as query
+        std::vector<llama_token> suffix(match_key.end() - n, match_key.end());
 
-//     return final_match_n;
-// }
+        // Find all match positions for this n-gram
+        std::vector<int> match_positions;
+        for (int i = 0; i <= search_size - n; ++i) {
+            bool match = true;
+            for (int j = 0; j < n; ++j) {
+                if (search_space[i + j] != suffix[j]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                match_positions.push_back(i);
+            }
+        }
+
+        if (match_positions.empty()) {
+            continue; // Try shorter n-gram
+        }
+
+        // Check if any match position has valid continuation
+        bool has_valid_continuation = false;
+        for (int pos : match_positions) {
+            if (pos + n < search_size) {
+                has_valid_continuation = true;
+                break;
+            }
+        }
+
+        if (!has_valid_continuation) {
+            continue; // No valid continuations found
+        }
+
+        // Find the best candidate using frequency-based ranking
+        std::vector<llama_token> best_candidate = select_best_candidate(search_space, match_positions, n, n_draft);
+        
+        // Copy the best candidate to draft
+        draft.insert(draft.end(), best_candidate.begin(), best_candidate.end());
+        return n;
+    }
+
+    return 0; // No match found
+}
+
+// Interleaved version that searches prompt first, then static cache for each n-gram length
+// Returns a pair: {match_n, source} where source is 'P' for prompt, 'S' for static, 'X' for no match
+std::pair<int, char> common_ngram_cache_interleave(const std::vector<llama_token> & static_cache,
+                                                  const std::vector<llama_token> & inp,
+                                                  std::vector<llama_token> & draft,
+                                                  int n_draft,
+                                                  int ngram_min,
+                                                  int ngram_max) {
+    const int inp_size = inp.size();
+    const int static_size = static_cache.size();
+
+    if (inp_size < ngram_min || static_size < ngram_min) {
+        return {0, 'X'};
+    }
+
+    // Create search space from prompt history (excluding last ngram_min tokens to avoid overlap)
+    std::vector<llama_token> search_space;
+    if (inp_size > ngram_min) {
+        search_space = std::vector<llama_token>(inp.begin(), inp.end() - ngram_min);
+    }
+
+    const int max_n = std::min(ngram_max, inp_size);
+
+    for (int n = max_n; n >= ngram_min; --n) {
+        // Take the last n tokens of inp as query
+        std::vector<llama_token> suffix(inp.end() - n, inp.end());
+
+        // First, try to find match in prompt history (search_space)
+        if (!search_space.empty() && (int)search_space.size() >= n) {
+            for (int i = 0; i <= (int)search_space.size() - n; ++i) {
+                bool match = true;
+                for (int j = 0; j < n; ++j) {
+                    if (search_space[i + j] != suffix[j]) {
+                        match = false;
+                        break;
+                    }
+                }
+
+                if (match) {
+                    // Draft up to n_draft tokens after the match from prompt history
+                    for (int j = 0; j < n_draft && (i + n + j) < (int)search_space.size(); ++j) {
+                        draft.push_back(search_space[i + n + j]);
+                    }
+                    return {n, 'P'}; // Found in prompt
+                }
+            }
+        }
+
+        // If not found in prompt history, try static cache with advanced selection
+        if (static_size >= n) {
+            // Find all match positions in static cache
+            std::vector<int> match_positions;
+            for (int i = 0; i <= static_size - n; ++i) {
+                bool match = true;
+                for (int j = 0; j < n; ++j) {
+                    if (static_cache[i + j] != suffix[j]) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) {
+                    match_positions.push_back(i);
+                }
+            }
+
+            if (!match_positions.empty()) {
+                // Check if any match position has valid continuation
+                bool has_valid_continuation = false;
+                for (int pos : match_positions) {
+                    if (pos + n < static_size) {
+                        has_valid_continuation = true;
+                        break;
+                    }
+                }
+
+                if (has_valid_continuation) {
+                    // Use advanced selection for static cache
+                    std::vector<llama_token> best_candidate = select_best_candidate(static_cache, match_positions, n, n_draft);
+                    
+                    // Copy the best candidate to draft
+                    draft.insert(draft.end(), best_candidate.begin(), best_candidate.end());
+                    return {n, 'S'}; // Found in static cache
+                }
+            }
+        }
+    }
+
+    return {0, 'X'}; // No match found in either source
+}
 
 
 std::vector<llama_token> load_static_token_cache() {
     LOG_INF("[0528 start load_static_token_cache]");
-    const std::string file_path = "C:/Users/Administrator/Documents/ngram-spec/outputs/code/magpie-code-tokens.bin";
+    const std::string file_path = "C:/Users/Administrator/Documents/ngram-spec/outputs/code/magpie-all-tokens.bin"; // enlarge dataset
     std::ifstream file(file_path, std::ios::binary);
 
     if (!file.is_open()) {
@@ -451,31 +600,39 @@ int main(int argc, char ** argv){
         const int64_t t_start_draft_us = ggml_time_us();
         last_match_n = match_n;
         last_source = source;
-        source = "X";
-        std::vector<llama_token> search_space;
-        if (inp.size() > params.ngram_min) {
-            search_space = std::vector<llama_token>(inp.begin(), inp.end() - params.ngram_min);
-            match_n = common_ngram_cache_draft(search_space, inp, draft, n_draft, params.ngram_min, params.ngram_max);
-        }
+        // source = "X";
+        // std::vector<llama_token> search_space;
+
+        // Use interleaved search: prompt first, then static cache for each n-gram length
+        auto result = common_ngram_cache_interleave(static_cache, inp, draft, n_draft, params.ngram_min, params.ngram_max); // use a larger ngram_max to test performance
+        match_n = result.first;
+        source = std::string(1, result.second); 
+
+        // // Search draft in prompt+answer first
+        // if (inp.size() > params.ngram_min) {
+        //     search_space = std::vector<llama_token>(inp.begin(), inp.end() - params.ngram_min);
+        //     match_n = common_ngram_cache_draft(search_space, inp, draft, n_draft, params.ngram_min, params.ngram_max);
+        // }
         
-        if (draft.size() == 1) {
-            // LOG_INF("[draft fallback] Draft size is 1, falling back to static_cache\n");
-            match_n = common_ngram_cache_draft(static_cache, inp, draft, n_draft, params.ngram_min, params.ngram_max); // just want to try this
+        // if (draft.size() == 1) {
+        //     // LOG_INF("[draft fallback] Draft size is 1, falling back to static_cache\n");
+        //     match_n = common_ngram_cache_draft_advanced(static_cache, inp, draft, n_draft, params.ngram_min, params.ngram_max); // use a larger ngram_max for static?
+        //     // match_n = common_ngram_cache_draft(static_cache, inp, draft, n_draft, params.ngram_min, params.ngram_max);
 
-            std::string draft_str = "[";
-            for (size_t i = 0; i < draft.size(); ++i) {
-                draft_str += std::to_string(draft[i]);
-                if (i < draft.size() - 1) {
-                    draft_str += ", ";
-                }
-            }
-            draft_str += "]";
+        //     std::string draft_str = "[";
+        //     for (size_t i = 0; i < draft.size(); ++i) {
+        //         draft_str += std::to_string(draft[i]);
+        //         if (i < draft.size() - 1) {
+        //             draft_str += ", ";
+        //         }
+        //     }
+        //     draft_str += "]";
 
-            // LOG_INF("[0528 Draft from Static]: %s\n", draft_str.c_str());
-            source = match_n > 0 ? "S" : "X";
-        } else {
-            source = "P";
-        }
+        //     // LOG_INF("[0528 Draft from Static]: %s\n", draft_str.c_str());
+        //     source = match_n > 0 ? "S" : "X";
+        // } else {
+        //     source = "P";
+        // }
 
         verify_list.emplace_back(last_match_n, accept_length, last_source);
 
