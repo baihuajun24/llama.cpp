@@ -308,6 +308,7 @@ std::pair<int, char> common_ngram_cache_interleave(const std::vector<llama_token
 std::vector<llama_token> load_static_token_cache() {
     LOG_INF("[0528 start load_static_token_cache]");
     const std::string file_path = "C:/Users/Administrator/Documents/ngram-spec/outputs/code/magpie-all-tokens.bin"; // enlarge dataset
+    //const std::string file_path = "D:/outputs/code/code-10G-tokens.bin";
     std::ifstream file(file_path, std::ios::binary);
 
     if (!file.is_open()) {
@@ -481,8 +482,8 @@ int main(int argc, char ** argv){
     int n_predict = 0;
     int n_drafted = 0;
     int n_accept  = 0;
-    // a list for n_accept
-    std::vector<std::tuple<int, int, std::string>> verify_list;
+    // a list for n_accept - enhanced to match lookup.cpp format with source field
+    std::vector<std::tuple<int, int, int64_t, int64_t, int64_t, std::string>> verify_list;
 
     int n_past = inp.size();
 
@@ -520,6 +521,9 @@ int main(int argc, char ** argv){
         int i_dft = 0;
         int accept_length = 1;
 
+        // Track verification timing
+        const auto t_verify_start = ggml_time_us();
+        
         while (true) {
             // sample from the target model
             llama_token id = common_sampler_sample(smpl, ctx, i_dft);
@@ -582,6 +586,10 @@ int main(int argc, char ** argv){
             break;
         }
         
+        // End verification timing
+        const auto t_verify_end = ggml_time_us();
+        const int64_t verify_time_us = t_verify_end - t_verify_start;
+        
         
         if ((params.n_predict > 0 && n_predict > params.n_predict) || has_eos) {
             break;
@@ -597,6 +605,7 @@ int main(int argc, char ** argv){
         // Draft already contains a single token sampled from the model:
         GGML_ASSERT(draft.size() == 1);
         GGML_ASSERT(draft[0] == inp.back());
+        const size_t original_draft_size = draft.size();
         const int64_t t_start_draft_us = ggml_time_us();
         last_match_n = match_n;
         last_source = source;
@@ -634,13 +643,12 @@ int main(int argc, char ** argv){
         //     source = "P";
         // }
 
-        verify_list.emplace_back(last_match_n, accept_length, last_source);
+        verify_list.emplace_back(match_n, accept_length, draft.size() - original_draft_size, ggml_time_us() - t_start_draft_us, verify_time_us, last_source);
 
         for (size_t i = 1; i < draft.size(); ++i) {
             common_batch_add(batch_tgt, draft[i], n_past + i, { 0 }, true);
         }
 
-        t_draft_us += ggml_time_us() - t_start_draft_us;
         n_drafted += draft.size() - 1;
 
         llama_decode(ctx, batch_tgt);
@@ -663,11 +671,22 @@ int main(int argc, char ** argv){
     int count_prompt = 0;
     int count_static = 0;
 
+    // Add timing analysis similar to lookup.cpp
+    int64_t total_draft_time = 0;
+    int64_t total_verify_time = 0;
+    int64_t total_draft_size = 0;
+
     for (const auto &entry : verify_list) {
         int accept_len = std::get<1>(entry);
-        const std::string &source = std::get<2>(entry);
+        int64_t draft_size = std::get<2>(entry);
+        int64_t draft_time = std::get<3>(entry);
+        int64_t verify_time = std::get<4>(entry);
+        const std::string &source = std::get<5>(entry);
 
         sum += accept_len;
+        total_draft_time += draft_time;
+        total_verify_time += verify_time;
+        total_draft_size += draft_size;
 
         if (source == "P") {
             sum_prompt += accept_len;
@@ -681,11 +700,16 @@ int main(int argc, char ** argv){
     float average = verify_list.empty() ? 0 : sum / verify_list.size();
     float average_prompt = count_prompt > 0 ? sum_prompt / count_prompt : 0;
     float average_static = count_static > 0 ? sum_static / count_static : 0;
+    
+    // Timing averages
+    float avg_draft_time = verify_list.empty() ? 0 : (float)total_draft_time / verify_list.size() / 1000.0f; // Convert to ms
+    float avg_verify_time = verify_list.empty() ? 0 : (float)total_verify_time / verify_list.size() / 1000.0f; // Convert to ms
+    float avg_draft_size = verify_list.empty() ? 0 : (float)total_draft_size / verify_list.size();
 
     std::string verify_list_str = "[";
     for (size_t i = 0; i < verify_list.size(); ++i) {
-        auto [match_n, accept_len, source] = verify_list[i];
-        verify_list_str += "(" + std::to_string(match_n) + "," + std::to_string(accept_len) + "," + source + ")";
+        auto [match_n, accept_len, draft_size, draft_time_us, verify_time_us, source] = verify_list[i];
+        verify_list_str += "(" + std::to_string(match_n) + "," + std::to_string(accept_len) + "," + std::to_string(draft_size) + "," + std::to_string(draft_time_us) + "," + std::to_string(verify_time_us) + "," + source + ")";
         if (i < verify_list.size() - 1) {
             verify_list_str += ", ";
         }
@@ -695,6 +719,8 @@ int main(int argc, char ** argv){
     LOG_INF("0420 Check: len is %zu, verify_list = %s\n", verify_list.size(), verify_list_str.c_str());
     LOG_INF("0420 Check: accept length average     = %.3f\n", average);
     LOG_INF("0420 Check: prompt avg                = %.3f, static avg = %.3f\n", average_prompt, average_static);
+    LOG_INF("Timing Analysis: avg draft time = %.3f ms, avg verify time = %.3f ms, avg draft size = %.1f\n", 
+            avg_draft_time, avg_verify_time, avg_draft_size);
     LOG_INF("0428 Check: no draft is supplied forward times = %d\n", n_no_draft_forward);
 
     if (write_to_file) {
@@ -708,7 +734,10 @@ int main(int argc, char ** argv){
             output_file << "# Accept length average: " << average << "\n";
             output_file << "# Accept Length for Prompt: " << std::fixed << std::setprecision(2)
                         << average_prompt << "; Accept Length for Static: " << average_static << "\n";
-            output_file << "# Verify list (match_n, accept_length, source): " << verify_list_str << "\n";
+            output_file << "# Timing Analysis: avg draft time = " << std::fixed << std::setprecision(3) 
+                        << avg_draft_time << " ms, avg verify time = " << avg_verify_time 
+                        << " ms, avg draft size = " << std::setprecision(1) << avg_draft_size << "\n";
+            output_file << "# Verify list (match_n, accept_length, draft_size, draft_time_us, verify_time_us, source): " << verify_list_str << "\n";
             output_file << generated_text.str();
             output_file.close();
             LOG_INF("Generated text written to: %s\n", params.out_file.c_str());

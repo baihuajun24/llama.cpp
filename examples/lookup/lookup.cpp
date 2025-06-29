@@ -11,6 +11,7 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include <tuple>
 
 int main(int argc, char ** argv){
     common_params params;
@@ -68,7 +69,7 @@ int main(int argc, char ** argv){
         if (!params.lookup_cache_dynamic.empty()) {
             try {
                 ngram_cache_dynamic = common_ngram_cache_load(params.lookup_cache_dynamic);
-                LOG_INF("0428 Check: loaded ngram_cache from this file: %s\n", params.lookup_cache_dynamic.c_str());
+                // LOG_INF("0428 Check: loaded ngram_cache from this file: %s\n", params.lookup_cache_dynamic.c_str());
             } catch (std::ifstream::failure const &) {} // if the file does not exist it will simply be created at the end of the program
         }
 
@@ -106,6 +107,9 @@ int main(int argc, char ** argv){
     // a list for n_accept
     std::vector<int> n_accept_list;
 
+    // Add a verification list to track (match_n, accept_length, draft_size, draft_time_us, verify_time_us)
+    std::vector<std::tuple<int, int, int64_t, int64_t, int64_t>> verify_list;
+
     int n_past = inp.size();
 
     bool has_eos = false;
@@ -136,6 +140,10 @@ int main(int argc, char ** argv){
 
         int i_dft = 0;
         int accept_length = 1;
+        
+        // Track verification timing
+        const auto t_verify_start = ggml_time_us();
+        
         while (true) {
             // sample from the target model
             llama_token id = common_sampler_sample(smpl, ctx, i_dft);
@@ -205,6 +213,11 @@ int main(int argc, char ** argv){
             }
             break;
         }
+        
+        // End verification timing
+        const auto t_verify_end = ggml_time_us();
+        const int64_t verify_time_us = t_verify_end - t_verify_start;
+        
         n_accept_list.push_back(accept_length);
         
         if ((params.n_predict > 0 && n_predict > params.n_predict) || has_eos) {
@@ -221,27 +234,25 @@ int main(int argc, char ** argv){
         // Draft already contains a single token sampled from the model:
         GGML_ASSERT(draft.size() == 1);
         GGML_ASSERT(draft[0] == inp.back());
-        const int64_t t_start_draft_us = ggml_time_us();
 
+        const int64_t t_start_draft_us = ggml_time_us();
+        const size_t original_draft_size = draft.size(); // Store original draft size before ngram_cache_draft
         common_ngram_cache_draft(inp, draft, n_draft, params.ngram_min, params.ngram_max, ngram_cache_context, ngram_cache_dynamic, ngram_cache_static);
+        const int64_t draft_time_us = ggml_time_us() - t_start_draft_us;
+
+        // Record to verify_list: (match_n, accept_length, draft_size, draft_time_us, verify_time_us)
+        // For lookup, match_n represents the number of tokens that matched (i_dft)
+        int match_n = i_dft;
+        verify_list.push_back(std::make_tuple(match_n, accept_length, draft.size() - original_draft_size, draft_time_us, verify_time_us));
+
         // LOG_INF to check last ngram_max tokens of inp and first ngram_max tokens of draft
-        // {
-        //     // Create a vector of the last ngram_max tokens from inp
-        //     std::vector<llama_token> last_inp_tokens;
-        //     size_t start_idx = (inp.size() >= params.ngram_max) ? (inp.size() - params.ngram_max) : 0;
-        //     last_inp_tokens.insert(last_inp_tokens.end(), inp.begin() + start_idx, inp.end());
-        //     LOG_INF("0427 Check: last %d tokens of inp: %s\n", 
-        //            (int)last_inp_tokens.size(),
-        //            string_from(ctx, last_inp_tokens).c_str());
-            
-        //     // Create a vector of the first ngram_max tokens from draft
-        //     std::vector<llama_token> first_draft_tokens;
-        //     size_t end_idx = std::min(draft.size(), (size_t)params.ngram_max);
-        //     first_draft_tokens.insert(first_draft_tokens.end(), draft.begin(), draft.begin() + end_idx);
-        //     LOG_INF("0427 Check: first %d tokens of draft: %s\n", 
-        //            (int)first_draft_tokens.size(),
-        //            string_from(ctx, first_draft_tokens).c_str());
-        // }
+        {
+            // Create a vector of the last ngram_max tokens from inp
+            std::vector<llama_token> last_inp_tokens;
+            size_t start_idx = (inp.size() >= params.ngram_max) ? (inp.size() - params.ngram_max) : 0;
+            last_inp_tokens.insert(last_inp_tokens.end(), inp.begin() + start_idx, inp.end());
+            // LOG_INF("0427 Check: last %d tokens of inp\n", (int)(inp.size() - start_idx));
+        }
         
         for (size_t i = 1; i < draft.size(); ++i) {
             common_batch_add(batch_tgt, draft[i], n_past + i, { 0 }, true);
@@ -290,17 +301,50 @@ int main(int argc, char ** argv){
     LOG_INF("0420 Check: accept length average      = %.3f\n", average);
     LOG_INF("0428 Check: no draft is suppiled forward times = %d\n", n_no_draft_forward);
 
+    // Calculate accept length average from verify_list (for consistency with speculative-simple)
+    float verify_sum = 0;
+    for (size_t i = 0; i < verify_list.size(); i++) {
+        verify_sum += std::get<1>(verify_list[i]); // Access the accept_length part
+    }
+    float verify_average = verify_list.empty() ? 0 : verify_sum / verify_list.size();
+
+    // Format the verify_list as a string
+    std::string verify_list_str = "[";
+    for (size_t i = 0; i < verify_list.size(); i++) {
+        verify_list_str += "(" + std::to_string(std::get<0>(verify_list[i])) + "," + 
+                          std::to_string(std::get<1>(verify_list[i])) + "," +
+                          std::to_string(std::get<2>(verify_list[i])) + "," +
+                          std::to_string(std::get<3>(verify_list[i])) + "," +
+                          std::to_string(std::get<4>(verify_list[i])) + ")";
+        if (i < verify_list.size() - 1) {
+            verify_list_str += ", ";
+        }
+    }
+    verify_list_str += "]";
+
+    LOG_INF("0420 Check: len is %d, verify_list = %s\n", (int)verify_list.size(), verify_list_str.c_str());
+    LOG_INF("0420 Check: verify accept length average = %.3f\n", verify_average);
+
+    // Calculate average draft size
+    float total_draft_size = 0;
+    for (const auto& item : verify_list) {
+        total_draft_size += std::get<2>(item);
+    }
+    float avg_draft_size = verify_list.empty() ? 0 : total_draft_size / verify_list.size();
+    LOG_INF("avg_draft_size = %.3f\n", avg_draft_size);
+
     // Write to file if requested
     if (write_to_file) {
         std::ofstream output_file(params.out_file);
         if (!output_file.is_open()) {
             LOG_ERR("Failed to open output file: %s\n", params.out_file.c_str());
         } else {
-            // First write the statistics as the first 3 lines
+            // First write the statistics as the first lines
             output_file << "# Tokens: " << n_predict << ", Speed: " 
                     << (n_predict  / ((t_dec_end - t_dec_start) / 1e6f)) << " t/s, # Forward: " 
-                    << n_accept_list.size() << "\n";
-            output_file << "# Accept length average: " << average << "\n";
+                    << verify_list.size() << ", n_draft: " << n_draft << "\n";
+            output_file << "# Accept length average: " << verify_average << "\n";
+            output_file << "# Verify list (match_n, accept_length, draft_size, draft_time_us, verify_time_us): " << verify_list_str << "\n";
             output_file << "# Accept length list: " << accept_list_str << "\n";
             // Write all collected text at once
             output_file << generated_text.str();
