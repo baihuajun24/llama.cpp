@@ -138,13 +138,19 @@ int main(int argc, char** argv) {
     // Load static ngram table
     NGramTable ng_table;
     bool table_loaded = false;
-    if (!table_params.load_table.empty()) {
-        LOG_INF("Loading ngram table from %s\n", table_params.load_table.c_str());
-        table_loaded = ng_table.load(table_params.load_table);
+    if (!table_loaded) {
+        const std::string table_path = "C:/Users/Administrator/Documents/ngram-spec/cache/llama3_ngram_code_50k.bin";
+        LOG_INF("0630 Loading ngram table from %s\n", table_path.c_str());
+        table_loaded = ng_table.load(table_path);
         if (table_loaded) {
             auto stats = ng_table.get_stats();
-            LOG_INF("Loaded ngram table with %zu n-grams (min_n=%u, max_n=%u, horizon=%u)\n",
+            LOG_INF("0630 Loaded ngram table with %zu n-grams (min_n=%u, max_n=%u, horizon=%u)\n",
                     stats.total_ngrams, stats.min_n, stats.max_n, stats.horizon);
+            
+            // [Added on 0701] Debug: Show a few sample entries to verify correct loading
+            ng_table.debug_show_entries(5);
+        } else {
+            LOG_ERR("0630 Failed to load ngram table from %s\n", table_path.c_str());
         }
     }
     

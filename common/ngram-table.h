@@ -37,6 +37,9 @@ public:
     };
     Stats get_stats() const;
 
+    // Debug function to show sample entries
+    void debug_show_entries(int max_entries = 5) const;
+
 private:
     static constexpr const char MAGIC[9] = "NGRAMTBL";
     static constexpr uint32_t VERSION = 1;

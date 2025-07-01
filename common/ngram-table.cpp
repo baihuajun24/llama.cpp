@@ -42,22 +42,41 @@ bool NGramTable::read_ngram_entry(std::ifstream& file) {
         return false;
     }
 
-    // Read tokens
+    // Read tokens in the n-gram
     std::vector<llama_token> tokens(n);
-    file.read(reinterpret_cast<char*>(tokens.data()), n * sizeof(llama_token));
+    for (uint32_t i = 0; i < n; i++) {
+        file.read(reinterpret_cast<char*>(&tokens[i]), sizeof(llama_token));
+    }
 
     // Create common_ngram from tokens
     common_ngram key(tokens.data(), n);
 
-    // Read future token predictions
-    uint32_t n_predictions;
-    file.read(reinterpret_cast<char*>(&n_predictions), sizeof(n_predictions));
+    // Read frequency (this was missing in the original code!)
+    uint32_t frequency;
+    file.read(reinterpret_cast<char*>(&frequency), sizeof(frequency));
 
-    std::vector<FutureToken> predictions(n_predictions);
-    file.read(reinterpret_cast<char*>(predictions.data()), n_predictions * sizeof(FutureToken));
+    // Read future tokens data for each horizon position
+    std::vector<FutureToken> all_predictions;
+    
+    for (uint32_t pos = 0; pos < horizon; pos++) {
+        // Read number of future tokens for this position
+        uint32_t num_tokens;
+        file.read(reinterpret_cast<char*>(&num_tokens), sizeof(num_tokens));
+        
+        // Read each token and its frequency for this position
+        for (uint32_t i = 0; i < num_tokens; i++) {
+            llama_token token;
+            uint32_t count;
+            file.read(reinterpret_cast<char*>(&token), sizeof(token));
+            file.read(reinterpret_cast<char*>(&count), sizeof(count));
+            
+            // Add to predictions list
+            all_predictions.push_back({token, count});
+        }
+    }
 
     // Store in table
-    table.emplace(key, std::move(predictions));
+    table.emplace(key, std::move(all_predictions));
     return true;
 }
 
@@ -72,11 +91,11 @@ bool NGramTable::load(const std::string& filename) {
             return false;
         }
 
-        // Read n-gram entries
-        uint32_t n_entries;
+        // Read table size (FIXED: was reading uint32_t, should be uint64_t!)
+        uint64_t n_entries;
         file.read(reinterpret_cast<char*>(&n_entries), sizeof(n_entries));
 
-        for (uint32_t i = 0; i < n_entries; i++) {
+        for (uint64_t i = 0; i < n_entries; i++) {
             if (!read_ngram_entry(file)) {
                 continue; // Skip invalid entries
             }
@@ -84,6 +103,7 @@ bool NGramTable::load(const std::string& filename) {
 
         return true;
     } catch (const std::exception& e) {
+        std::cerr << "Error loading ngram table: " << e.what() << std::endl;
         return false;
     }
 }
@@ -118,4 +138,43 @@ NGramTable::Stats NGramTable::get_stats() const {
         max_n,
         horizon
     };
+}
+
+void NGramTable::debug_show_entries(int max_entries) const {
+    std::cout << "\n=== NGramTable Debug Info ===" << std::endl;
+    std::cout << "Total entries: " << table.size() << std::endl;
+    std::cout << "Configuration: min_n=" << min_n << ", max_n=" << max_n << ", horizon=" << horizon << std::endl;
+    
+    int count = 0;
+    for (const auto& entry : table) {
+        if (count >= max_entries) break;
+        
+        const auto& ngram = entry.first;
+        const auto& predictions = entry.second;
+        
+        // Print the n-gram tokens
+        std::cout << "\nEntry " << (count + 1) << ": N-gram [";
+        bool first = true;
+        for (int i = 0; i < LLAMA_NGRAM_MAX; i++) {
+            if (ngram.tokens[i] == LLAMA_TOKEN_NULL) break;
+            if (!first) std::cout << ", ";
+            std::cout << ngram.tokens[i];
+            first = false;
+        }
+        std::cout << "]" << std::endl;
+        
+        // Print future token predictions
+        std::cout << "  Future tokens (" << predictions.size() << "): ";
+        for (size_t i = 0; i < std::min(predictions.size(), size_t(10)); i++) {
+            if (i > 0) std::cout << ", ";
+            std::cout << predictions[i].token << ":" << predictions[i].frequency;
+        }
+        if (predictions.size() > 10) {
+            std::cout << " ... (+" << (predictions.size() - 10) << " more)";
+        }
+        std::cout << std::endl;
+        
+        count++;
+    }
+    std::cout << "=========================" << std::endl;
 } 
