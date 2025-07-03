@@ -28,6 +28,11 @@ public:
     void draft(const std::vector<llama_token>& input, std::vector<llama_token>& draft, 
                int n_draft, int min_n, int max_n);
 
+    // Interleaved draft: first search in prompt history, then static table
+    std::pair<int, char> interleave_draft(const std::vector<llama_token>& input, 
+                                          std::vector<llama_token>& draft, 
+                                          int n_draft, int min_n, int max_n);
+
     // Get table statistics
     struct Stats {
         size_t total_ngrams;

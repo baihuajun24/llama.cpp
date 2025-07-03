@@ -131,6 +131,70 @@ void NGramTable::draft(const std::vector<llama_token>& input, std::vector<llama_
     }
 }
 
+std::pair<int, char> NGramTable::interleave_draft(const std::vector<llama_token>& input, 
+                                                  std::vector<llama_token>& draft, 
+                                                  int n_draft, int min_n, int max_n) {
+    const int inp_size = input.size();
+    
+    if (inp_size < min_n) {
+        return {0, 'X'};
+    }
+
+    // Create search space from prompt history (excluding last min_n tokens to avoid overlap)
+    std::vector<llama_token> search_space;
+    if (inp_size > min_n) {
+        search_space = std::vector<llama_token>(input.begin(), input.end() - min_n);
+    }
+
+    const int max_n_actual = std::min(max_n, inp_size);
+
+    for (int n = max_n_actual; n >= min_n; --n) {
+        if (inp_size < n) continue;
+
+        // First, try to find match in prompt history (search_space)
+        if (!search_space.empty() && (int)search_space.size() >= n) {
+            // Take the last n tokens of input as query
+            std::vector<llama_token> suffix(input.end() - n, input.end());
+            
+            for (int i = 0; i <= (int)search_space.size() - n; ++i) {
+                bool match = true;
+                for (int j = 0; j < n; ++j) {
+                    if (search_space[i + j] != suffix[j]) {
+                        match = false;
+                        break;
+                    }
+                }
+
+                if (match) {
+                    // Draft up to n_draft tokens after the match from prompt history
+                    for (int j = 0; j < n_draft && (i + n + j) < (int)search_space.size(); ++j) {
+                        draft.push_back(search_space[i + n + j]);
+                    }
+                    return {n, 'P'}; // Found in prompt
+                }
+            }
+        }
+
+        // If not found in prompt history, try static ngram table
+        // Create common_ngram from the last n tokens
+        common_ngram key(input.data() + input.size() - n, n);
+        
+        // Look up in table
+        auto it = table.find(key);
+        if (it != table.end()) {
+            // Found a match - add predictions to draft
+            const auto& predictions = it->second;
+            for (const auto& pred : predictions) {
+                if (static_cast<int>(draft.size()) >= n_draft) break;
+                draft.push_back(pred.token);
+            }
+            return {n, 'S'}; // Found in static table
+        }
+    }
+
+    return {0, 'X'}; // No match found in either source
+}
+
 NGramTable::Stats NGramTable::get_stats() const {
     return Stats{
         table.size(),

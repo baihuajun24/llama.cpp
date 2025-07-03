@@ -289,7 +289,8 @@ int main(int argc, char** argv) {
         
         // Try to get draft tokens from the static ngram table
         if (table_loaded) {
-            ng_table.draft(inp, draft, n_draft, table_params.ngram_min, table_params.ngram_max);
+            // ng_table.draft(inp, draft, n_draft, table_params.ngram_min, table_params.ngram_max); // commented out on 0703, this method only uses static table for draft
+            auto result = ng_table.interleave_draft(inp, draft, n_draft, table_params.ngram_min, table_params.ngram_max);
         }
         
         t_draft_us += ggml_time_us() - t_start_draft_us;
