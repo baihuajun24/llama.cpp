@@ -139,8 +139,11 @@ int main(int argc, char** argv) {
     NGramTable ng_table;
     bool table_loaded = false;
     if (!table_loaded) {
-        const std::string table_path = "C:/Users/Administrator/Documents/ngram-spec/cache/llama3_ngram_code_50k.bin";
-        LOG_INF("0630 Loading ngram table from %s\n", table_path.c_str());
+        // const std::string table_path = "C:/Users/Administrator/Documents/ngram-spec/cache/llama3_ngram_code_50k.bin";
+        // const std::string table_path = "C:/Users/Administrator/Downloads/llama3_ngram_coding_debugging_all.bin";
+        const std::string table_path = "C:/Users/Administrator/Downloads/llama3_ngram_merged.bin";
+        LOG_INF("0707 Loading ngram table(mmap) from %s\n", table_path.c_str());
+        // table_loaded = ng_table.load_mmap(table_path);
         table_loaded = ng_table.load(table_path);
         if (table_loaded) {
             auto stats = ng_table.get_stats();
@@ -289,8 +292,9 @@ int main(int argc, char** argv) {
         
         // Try to get draft tokens from the static ngram table
         if (table_loaded) {
-            // ng_table.draft(inp, draft, n_draft, table_params.ngram_min, table_params.ngram_max); // commented out on 0703, this method only uses static table for draft
-            auto result = ng_table.interleave_draft(inp, draft, n_draft, table_params.ngram_min, table_params.ngram_max);
+            ng_table.draft(inp, draft, n_draft, table_params.ngram_min, table_params.ngram_max); // commented out on 0703, this method only uses static table for draft
+            // auto result = ng_table.interleave_draft(inp, draft, n_draft, table_params.ngram_min, table_params.ngram_max);
+            //ng_table.draft_mmap(inp, draft, n_draft, table_params.ngram_min, table_params.ngram_max);
         }
         
         t_draft_us += ggml_time_us() - t_start_draft_us;

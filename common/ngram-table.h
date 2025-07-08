@@ -19,14 +19,23 @@ struct FutureToken {
 class NGramTable {
 public:
     NGramTable();
-    ~NGramTable() = default;
+    ~NGramTable();
 
-    // Load table from binary file
+    // Original in-memory loading
     bool load(const std::string& filename);
+
+    // Memory-mapped file loading
+    bool load_mmap(const std::string& filename);
+    void unload_mmap();
+    bool is_mmap_loaded() const { return mapped_data != nullptr; }
 
     // Draft next tokens based on input sequence
     void draft(const std::vector<llama_token>& input, std::vector<llama_token>& draft, 
                int n_draft, int min_n, int max_n);
+
+    // Memory-mapped draft
+    void draft_mmap(const std::vector<llama_token>& input, std::vector<llama_token>& draft, 
+                    int n_draft, int min_n, int max_n);
 
     // Interleaved draft: first search in prompt history, then static table
     std::pair<int, char> interleave_draft(const std::vector<llama_token>& input, 
@@ -56,7 +65,21 @@ private:
     // Map from n-gram to its future token predictions
     std::unordered_map<common_ngram, std::vector<FutureToken>, common_ngram_hash_function> table;
 
+    // Memory-mapped data
+    void* mapped_data;
+    size_t file_size;
+    std::unordered_map<common_ngram, size_t, common_ngram_hash_function> mmap_index; // ngram -> file offset
+
     // Helper functions
     bool read_header(std::ifstream& file);
     bool read_ngram_entry(std::ifstream& file);
+
+    // Memory-mapped helper functions
+    bool read_header_mmap(const char* data, size_t& offset);
+    bool build_mmap_index();
+    std::vector<FutureToken> lookup_mmap(const common_ngram& key);
+    
+    // Platform-specific memory mapping
+    bool map_file(const std::string& filename);
+    void unmap_file();
 }; 
