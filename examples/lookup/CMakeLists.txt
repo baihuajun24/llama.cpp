@@ -49,6 +49,27 @@ install(TARGETS ${TARGET_NGRAM_TABLE} RUNTIME)
 target_link_libraries(${TARGET_NGRAM_TABLE} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET_NGRAM_TABLE} PRIVATE cxx_std_17)
 
+# (0707 added) Add the new build-suffix-array executable
+set(TARGET_BUILD_SUFFIX_ARRAY llama-build-suffix-array)
+add_executable(${TARGET_BUILD_SUFFIX_ARRAY} build-suffix-array.cpp ../../common/ngram-suffix.cpp)
+install(TARGETS ${TARGET_BUILD_SUFFIX_ARRAY} RUNTIME)
+target_link_libraries(${TARGET_BUILD_SUFFIX_ARRAY} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET_BUILD_SUFFIX_ARRAY} PRIVATE cxx_std_17)
+
+# (0708 added) Add the new sample-ngram-table executable
+set(TARGET_SAMPLE_NGRAM_TABLE llama-sample-ngram-table)
+add_executable(${TARGET_SAMPLE_NGRAM_TABLE} sample-ngram-table.cpp)
+install(TARGETS ${TARGET_SAMPLE_NGRAM_TABLE} RUNTIME)
+target_link_libraries(${TARGET_SAMPLE_NGRAM_TABLE} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET_SAMPLE_NGRAM_TABLE} PRIVATE cxx_std_17)
+
+# (0710 added) Add the new lookup-suffix executable
+set(TARGET_LOOKUP_SUFFIX llama-lookup-suffix)
+add_executable(${TARGET_LOOKUP_SUFFIX} lookup-suffix.cpp ../../common/ngram-suffix.cpp)
+install(TARGETS ${TARGET_LOOKUP_SUFFIX} RUNTIME)
+target_link_libraries(${TARGET_LOOKUP_SUFFIX} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET_LOOKUP_SUFFIX} PRIVATE cxx_std_17)
+
 # --- Skip building build-ngram-index (temporary) ---
 # set(TARGET_BUILD_NGRAM_INDEX build-ngram-index)
 # add_executable(${TARGET_BUILD_NGRAM_INDEX} build-ngram-index.cpp)
