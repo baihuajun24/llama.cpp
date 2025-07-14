@@ -54,6 +54,18 @@ public:
     // Debug function to show sample entries
     void debug_show_entries(int max_entries = 5) const;
 
+    // Sampling function to create smaller datasets
+    static bool sample_then_save(const std::string& input_file, 
+                                const std::string& output_file_1pct, 
+                                const std::string& output_file_10pct,
+                                unsigned int random_seed = 42);
+    
+    // Sampling function to create multiple percentage samples
+    static bool sample_multiple_percentages(const std::string& input_file,
+                                           const std::vector<int>& percentages,
+                                           const std::string& output_prefix,
+                                           unsigned int random_seed = 42);
+
 private:
     static constexpr const char MAGIC[9] = "NGRAMTBL";
     static constexpr uint32_t VERSION = 1;

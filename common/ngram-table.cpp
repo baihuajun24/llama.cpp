@@ -6,6 +6,8 @@
 #include <cstring>
 #include <algorithm>
 #include <stdexcept>
+#include <random>
+#include <numeric>
 
 // Platform-specific includes for memory mapping
 #ifdef _WIN32
@@ -487,4 +489,252 @@ void NGramTable::debug_show_entries(int max_entries) const {
         count++;
     }
     std::cout << "=========================" << std::endl;
+}
+
+// Sample and save function to create smaller datasets
+bool NGramTable::sample_then_save(const std::string& input_file,
+                                  const std::string& output_file_1pct,
+                                  const std::string& output_file_10pct,
+                                  unsigned int random_seed) {
+    std::cout << "Loading original file: " << input_file << std::endl;
+    
+    // Load the original file
+    NGramTable original_table;
+    if (!original_table.load(input_file)) {
+        std::cerr << "Failed to load original file: " << input_file << std::endl;
+        return false;
+    }
+    
+    std::cout << "Original table loaded with " << original_table.table.size() << " entries" << std::endl;
+    
+    // Create a vector of all entries for sampling
+    std::vector<std::pair<common_ngram, std::vector<FutureToken>>> all_entries;
+    all_entries.reserve(original_table.table.size());
+    
+    for (const auto& entry : original_table.table) {
+        all_entries.push_back(entry);
+    }
+    
+    std::cout << "Created entry vector with " << all_entries.size() << " entries" << std::endl;
+    
+    // Set up random number generator
+    std::mt19937 rng(random_seed);
+    
+    // Calculate sample sizes
+    size_t sample_1pct_size = (all_entries.size() * 1) / 100;
+    size_t sample_10pct_size = (all_entries.size() * 10) / 100;
+    
+    std::cout << "Sample sizes: 1% = " << sample_1pct_size << ", 10% = " << sample_10pct_size << std::endl;
+    
+    // Create shuffled indices
+    std::vector<size_t> indices(all_entries.size());
+    std::iota(indices.begin(), indices.end(), 0);
+    std::shuffle(indices.begin(), indices.end(), rng);
+    
+    // Helper function to save a sample
+    auto save_sample = [&](const std::string& filename, size_t sample_size) -> bool {
+        std::ofstream file(filename, std::ios::binary);
+        if (!file) {
+            std::cerr << "Failed to open output file: " << filename << std::endl;
+            return false;
+        }
+        
+        // Write header
+        file.write(original_table.MAGIC, 8);
+        file.write(reinterpret_cast<const char*>(&original_table.VERSION), sizeof(original_table.VERSION));
+        file.write(reinterpret_cast<const char*>(&original_table.min_n), sizeof(original_table.min_n));
+        file.write(reinterpret_cast<const char*>(&original_table.max_n), sizeof(original_table.max_n));
+        file.write(reinterpret_cast<const char*>(&original_table.horizon), sizeof(original_table.horizon));
+        
+        // Write table size
+        uint64_t table_size = static_cast<uint64_t>(sample_size);
+        file.write(reinterpret_cast<const char*>(&table_size), sizeof(table_size));
+        
+        // Write sampled entries
+        for (size_t i = 0; i < sample_size; i++) {
+            const auto& entry = all_entries[indices[i]];
+            const auto& ngram = entry.first;
+            const auto& predictions = entry.second;
+            
+            // Write n-gram length
+            uint32_t n = 0;
+            for (int j = 0; j < LLAMA_NGRAM_MAX; j++) {
+                if (ngram.tokens[j] == LLAMA_TOKEN_NULL) break;
+                n++;
+            }
+            file.write(reinterpret_cast<const char*>(&n), sizeof(n));
+            
+            // Write tokens
+            for (uint32_t j = 0; j < n; j++) {
+                file.write(reinterpret_cast<const char*>(&ngram.tokens[j]), sizeof(llama_token));
+            }
+            
+            // Write frequency (sum of all prediction frequencies)
+            uint32_t total_frequency = 0;
+            for (const auto& pred : predictions) {
+                total_frequency += pred.frequency;
+            }
+            file.write(reinterpret_cast<const char*>(&total_frequency), sizeof(total_frequency));
+            
+            // Write future tokens data for each horizon position
+            for (uint32_t pos = 0; pos < original_table.horizon; pos++) {
+                // Count tokens for this position
+                uint32_t num_tokens = 0;
+                for (size_t k = pos; k < predictions.size(); k += original_table.horizon) {
+                    if (k < predictions.size()) num_tokens++;
+                }
+                
+                file.write(reinterpret_cast<const char*>(&num_tokens), sizeof(num_tokens));
+                
+                // Write token data for this position
+                for (size_t k = pos; k < predictions.size(); k += original_table.horizon) {
+                    if (k < predictions.size()) {
+                        file.write(reinterpret_cast<const char*>(&predictions[k].token), sizeof(llama_token));
+                        file.write(reinterpret_cast<const char*>(&predictions[k].frequency), sizeof(uint32_t));
+                    }
+                }
+            }
+        }
+        
+        file.close();
+        return file.good();
+    };
+    
+    // Save 1% sample
+    std::cout << "Saving 1% sample to: " << output_file_1pct << std::endl;
+    if (!save_sample(output_file_1pct, sample_1pct_size)) {
+        std::cerr << "Failed to save 1% sample" << std::endl;
+        return false;
+    }
+    
+    // Save 10% sample
+    std::cout << "Saving 10% sample to: " << output_file_10pct << std::endl;
+    if (!save_sample(output_file_10pct, sample_10pct_size)) {
+        std::cerr << "Failed to save 10% sample" << std::endl;
+        return false;
+    }
+    
+    std::cout << "Successfully created both sample files!" << std::endl;
+    return true;
+}
+
+bool NGramTable::sample_multiple_percentages(const std::string& input_file,
+                                            const std::vector<int>& percentages,
+                                            const std::string& output_prefix,
+                                            unsigned int random_seed) {
+    std::cout << "Loading original file: " << input_file << std::endl;
+    
+    // Load the original file
+    NGramTable original_table;
+    if (!original_table.load(input_file)) {
+        std::cerr << "Failed to load original file: " << input_file << std::endl;
+        return false;
+    }
+    
+    std::cout << "Original table loaded with " << original_table.table.size() << " entries" << std::endl;
+    
+    // Create a vector of all entries for sampling
+    std::vector<std::pair<common_ngram, std::vector<FutureToken>>> all_entries;
+    all_entries.reserve(original_table.table.size());
+    
+    for (const auto& entry : original_table.table) {
+        all_entries.push_back(entry);
+    }
+    
+    std::cout << "Created entry vector with " << all_entries.size() << " entries" << std::endl;
+    
+    // Set up random number generator
+    std::mt19937 rng(random_seed);
+    
+    // Create shuffled indices
+    std::vector<size_t> indices(all_entries.size());
+    std::iota(indices.begin(), indices.end(), 0);
+    std::shuffle(indices.begin(), indices.end(), rng);
+    
+    // Helper function to save a sample
+    auto save_sample = [&](const std::string& filename, size_t sample_size) -> bool {
+        std::ofstream file(filename, std::ios::binary);
+        if (!file) {
+            std::cerr << "Failed to open output file: " << filename << std::endl;
+            return false;
+        }
+        
+        // Write header
+        file.write(original_table.MAGIC, 8);
+        file.write(reinterpret_cast<const char*>(&original_table.VERSION), sizeof(original_table.VERSION));
+        file.write(reinterpret_cast<const char*>(&original_table.min_n), sizeof(original_table.min_n));
+        file.write(reinterpret_cast<const char*>(&original_table.max_n), sizeof(original_table.max_n));
+        file.write(reinterpret_cast<const char*>(&original_table.horizon), sizeof(original_table.horizon));
+        
+        // Write table size
+        uint64_t table_size = static_cast<uint64_t>(sample_size);
+        file.write(reinterpret_cast<const char*>(&table_size), sizeof(table_size));
+        
+        // Write sampled entries
+        for (size_t i = 0; i < sample_size; i++) {
+            const auto& entry = all_entries[indices[i]];
+            const auto& ngram = entry.first;
+            const auto& predictions = entry.second;
+            
+            // Write n-gram length
+            uint32_t n = 0;
+            for (uint32_t j = 0; j < LLAMA_NGRAM_MAX; j++) {
+                if (ngram.tokens[j] == -1) break;
+                n++;
+            }
+            file.write(reinterpret_cast<const char*>(&n), sizeof(n));
+            
+            // Write tokens
+            for (uint32_t j = 0; j < n; j++) {
+                file.write(reinterpret_cast<const char*>(&ngram.tokens[j]), sizeof(llama_token));
+            }
+            
+            // Write frequency (set to 1 for simplicity)
+            uint32_t frequency = 1;
+            file.write(reinterpret_cast<const char*>(&frequency), sizeof(frequency));
+            
+            // Write future tokens data for each horizon position
+            size_t pred_idx = 0;
+            for (uint32_t pos = 0; pos < original_table.horizon; pos++) {
+                // Count tokens for this position
+                uint32_t tokens_for_pos = 0;
+                size_t start_idx = pred_idx;
+                
+                // In our simplified format, we distribute predictions evenly across horizon
+                size_t tokens_per_position = predictions.size() / original_table.horizon;
+                if (pos < predictions.size() % original_table.horizon) {
+                    tokens_per_position++;  // Distribute remainder
+                }
+                tokens_for_pos = static_cast<uint32_t>(tokens_per_position);
+                
+                file.write(reinterpret_cast<const char*>(&tokens_for_pos), sizeof(tokens_for_pos));
+                
+                // Write tokens and frequencies for this position
+                for (uint32_t j = 0; j < tokens_for_pos && pred_idx < predictions.size(); j++, pred_idx++) {
+                    file.write(reinterpret_cast<const char*>(&predictions[pred_idx].token), sizeof(llama_token));
+                    file.write(reinterpret_cast<const char*>(&predictions[pred_idx].frequency), sizeof(uint32_t));
+                }
+            }
+        }
+        
+        return file.good();
+    };
+    
+    // Process each percentage
+    for (int percentage : percentages) {
+        size_t sample_size = (all_entries.size() * percentage) / 100;
+        std::string output_file = output_prefix + "_" + std::to_string(percentage) + "pct.bin";
+        
+        std::cout << "Creating " << percentage << "% sample (" << sample_size << " entries) -> " << output_file << std::endl;
+        
+        if (!save_sample(output_file, sample_size)) {
+            std::cerr << "Failed to save " << percentage << "% sample to " << output_file << std::endl;
+            return false;
+        }
+        
+        std::cout << "Successfully saved " << percentage << "% sample" << std::endl;
+    }
+    
+    std::cout << "Successfully created all sample files!" << std::endl;
+    return true;
 } 

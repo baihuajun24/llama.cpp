@@ -139,21 +139,27 @@ int main(int argc, char** argv) {
     NGramTable ng_table;
     bool table_loaded = false;
     if (!table_loaded) {
-        // const std::string table_path = "C:/Users/Administrator/Documents/ngram-spec/cache/llama3_ngram_code_50k.bin";
-        // const std::string table_path = "C:/Users/Administrator/Downloads/llama3_ngram_coding_debugging_all.bin";
-        const std::string table_path = "C:/Users/Administrator/Downloads/llama3_ngram_merged.bin";
-        LOG_INF("0707 Loading ngram table(mmap) from %s\n", table_path.c_str());
-        // table_loaded = ng_table.load_mmap(table_path);
+        // Get table path from environment variable, with fallback
+        std::string table_path;
+        const char* env_table_path = std::getenv("TABLE_PATH");
+        if (env_table_path) {
+            table_path = std::string(env_table_path);
+        } else {
+            // Default fallback path
+            table_path = "C:/Users/Administrator/Downloads/llama3_ngram_coding_debugging_all.bin";
+        }
+        
+        LOG_INF("Loading ngram table from %s\n", table_path.c_str());
         table_loaded = ng_table.load(table_path);
         if (table_loaded) {
             auto stats = ng_table.get_stats();
-            LOG_INF("0630 Loaded ngram table with %zu n-grams (min_n=%u, max_n=%u, horizon=%u)\n",
+            LOG_INF("Loaded ngram table with %zu n-grams (min_n=%u, max_n=%u, horizon=%u)\n",
                     stats.total_ngrams, stats.min_n, stats.max_n, stats.horizon);
             
             // [Added on 0701] Debug: Show a few sample entries to verify correct loading
             ng_table.debug_show_entries(5);
         } else {
-            LOG_ERR("0630 Failed to load ngram table from %s\n", table_path.c_str());
+            LOG_ERR("Failed to load ngram table from %s\n", table_path.c_str());
         }
     }
     
@@ -198,7 +204,9 @@ int main(int argc, char** argv) {
     int n_drafted = 0;
     int n_accept = 0;
     int n_no_draft_forward = 0;
-    std::vector<std::pair<int, int>> verify_list;
+    
+    // Enhanced verify list to track retrieval time and draft length
+    std::vector<std::tuple<int, int, int64_t, int64_t, int64_t, std::string>> verify_list;
     
     int n_past = inp.size();
     bool has_eos = false;
@@ -212,6 +220,9 @@ int main(int argc, char** argv) {
     while (true) {
         int i_dft = 0;
         int accept_length = 1;
+        
+        // Track verification timing
+        const auto t_verify_start = ggml_time_us();
         
         while (true) {
             // Sample from the target model
@@ -273,7 +284,9 @@ int main(int argc, char** argv) {
             break;
         }
         
-        verify_list.push_back({0, accept_length});  // 0 for match_n since we're not tracking it yet
+        // End verification timing
+        const auto t_verify_end = ggml_time_us();
+        const int64_t verify_time_us = t_verify_end - t_verify_start;
         
         if ((params.n_predict > 0 && n_predict > params.n_predict) || has_eos) {
             break;
@@ -287,17 +300,32 @@ int main(int argc, char** argv) {
         
         GGML_ASSERT(draft.size() == 1);
         GGML_ASSERT(draft[0] == inp.back());
+        const size_t original_draft_size = draft.size();
         
+        // Draft retrieval timing
         const int64_t t_start_draft_us = ggml_time_us();
+        
+        int match_n = 0;
+        std::string source = "X";
         
         // Try to get draft tokens from the static ngram table
         if (table_loaded) {
-            ng_table.draft(inp, draft, n_draft, table_params.ngram_min, table_params.ngram_max); // commented out on 0703, this method only uses static table for draft
-            // auto result = ng_table.interleave_draft(inp, draft, n_draft, table_params.ngram_min, table_params.ngram_max);
-            //ng_table.draft_mmap(inp, draft, n_draft, table_params.ngram_min, table_params.ngram_max);
+            ng_table.draft(inp, draft, n_draft, table_params.ngram_min, table_params.ngram_max);
+            // Simple heuristic: if draft size increased, we found a match
+            if (draft.size() > original_draft_size) {
+                match_n = 1; // Simplified match tracking
+                source = "S"; // From static table; 0714 temporary usage for static only
+            }
         }
         
-        t_draft_us += ggml_time_us() - t_start_draft_us;
+        const int64_t t_end_draft_us = ggml_time_us();
+        const int64_t draft_time_us = t_end_draft_us - t_start_draft_us;
+        
+        // Record metrics: match_n, accept_length, draft_size, draft_time_us, verify_time_us, source
+        verify_list.emplace_back(match_n, accept_length, draft.size() - original_draft_size, 
+                                draft_time_us, verify_time_us, source);
+        
+        t_draft_us += draft_time_us;
         n_drafted += draft.size() - 1;
         
         for (size_t i = 1; i < draft.size(); ++i) {
@@ -312,45 +340,75 @@ int main(int argc, char** argv) {
     
     auto t_dec_end = ggml_time_us();
     
-    // Calculate statistics
+    // Compute statistics
     float sum = 0;
-    for (const auto& pair : verify_list) {
-        sum += pair.second;
+    float sum_prompt = 0;
+    float sum_static = 0;
+    int count_prompt = 0;
+    int count_static = 0;
+
+    int64_t total_draft_time = 0;
+    int64_t total_verify_time = 0;
+    int64_t total_draft_size = 0;
+
+    for (const auto& entry : verify_list) {
+        int accept_len = std::get<1>(entry);
+        int64_t draft_size = std::get<2>(entry);
+        int64_t draft_time = std::get<3>(entry);
+        int64_t verify_time = std::get<4>(entry);
+        const std::string& source = std::get<5>(entry);
+
+        sum += accept_len;
+        total_draft_time += draft_time;
+        total_verify_time += verify_time;
+        total_draft_size += draft_size;
+
+        if (source == "P") {
+            sum_prompt += accept_len;
+            count_prompt++;
+        } else if (source == "S") {
+            sum_static += accept_len;
+            count_static++;
+        }
     }
+
     float average = verify_list.empty() ? 0 : sum / verify_list.size();
-    
-    // Format verify_list as string
+    float average_prompt = count_prompt > 0 ? sum_prompt / count_prompt : 0;
+    float average_static = count_static > 0 ? sum_static / count_static : 0;
+
+    // Convert to milliseconds for readability
+    float avg_draft_time = verify_list.empty() ? 0 : (float)total_draft_time / verify_list.size() / 1000.0f;
+    float avg_verify_time = verify_list.empty() ? 0 : (float)total_verify_time / verify_list.size() / 1000.0f;
+    float avg_draft_size = verify_list.empty() ? 0 : (float)total_draft_size / verify_list.size();
+
     std::string verify_list_str = "[";
-    for (size_t i = 0; i < verify_list.size(); i++) {
-        verify_list_str += "(" + std::to_string(verify_list[i].first) + "," + 
-                          std::to_string(verify_list[i].second) + ")";
+    for (size_t i = 0; i < verify_list.size(); ++i) {
+        auto [match_n, accept_len, draft_size, draft_time_us, verify_time_us, source] = verify_list[i];
+        verify_list_str += "(" + std::to_string(match_n) + "," + std::to_string(accept_len) + "," + std::to_string(draft_size) + "," + std::to_string(draft_time_us) + "," + std::to_string(verify_time_us) + "," + source + ")";
         if (i < verify_list.size() - 1) {
             verify_list_str += ", ";
         }
     }
     verify_list_str += "]";
-    
+
     const float decoding_speed = n_predict / ((t_dec_end - t_dec_start) / 1e6f);
-    
+
     // Write to file if requested
     if (write_to_file) {
         std::ofstream output_file(params.out_file);
         if (!output_file.is_open()) {
             LOG_ERR("Failed to open output file: %s\n", params.out_file.c_str());
         } else {
-            output_file << "# Tokens: " << n_predict << ", Speed: " 
-                      << decoding_speed << " t/s, # Forward: " 
-                      << verify_list.size() << ", # No draft forward: " 
-                      << n_no_draft_forward << "\n";
-            output_file << "# Accept length average: " << average << "\n";
-            output_file << "# Verify list (match_n, accept_length): " << verify_list_str << "\n";
-            output_file << "# Average draft time per forward: " 
-                      << (verify_list.empty() ? 0.0 : (double)t_draft_us/verify_list.size()) 
-                      << " us\n";
-            
-            // Write the generated text
+            // Format to match parse_perf.py expectations
+            output_file << "# Tokens: " << n_predict << ", Speed: "
+                        << decoding_speed << " t/s, # Forward: "
+                        << verify_list.size() << ", # No draft forward: " << n_no_draft_forward << "\n";
+            output_file << "Accept length average: " << average << "\n";
+            output_file << "Verify list (match_n, accept_length, draft_size, draft_time_us, verify_time_us): " << verify_list_str << "\n";
+            output_file << "Average draft time per forward: " << avg_draft_time * 1000 << " us\n";
             output_file << generated_text.str();
             output_file.close();
+            LOG_INF("Generated text written to: %s\n", params.out_file.c_str());
         }
     }
     

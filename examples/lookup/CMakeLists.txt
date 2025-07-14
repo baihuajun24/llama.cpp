@@ -63,6 +63,13 @@ install(TARGETS ${TARGET_SAMPLE_NGRAM_TABLE} RUNTIME)
 target_link_libraries(${TARGET_SAMPLE_NGRAM_TABLE} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET_SAMPLE_NGRAM_TABLE} PRIVATE cxx_std_17)
 
+# Add the new sample-ngram-multiple executable  
+set(TARGET_SAMPLE_NGRAM_MULTIPLE llama-sample-ngram-multiple)
+add_executable(${TARGET_SAMPLE_NGRAM_MULTIPLE} sample-ngram-multiple.cpp)
+install(TARGETS ${TARGET_SAMPLE_NGRAM_MULTIPLE} RUNTIME)
+target_link_libraries(${TARGET_SAMPLE_NGRAM_MULTIPLE} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET_SAMPLE_NGRAM_MULTIPLE} PRIVATE cxx_std_17)
+
 # (0710 added) Add the new lookup-suffix executable
 set(TARGET_LOOKUP_SUFFIX llama-lookup-suffix)
 add_executable(${TARGET_LOOKUP_SUFFIX} lookup-suffix.cpp ../../common/ngram-suffix.cpp)
