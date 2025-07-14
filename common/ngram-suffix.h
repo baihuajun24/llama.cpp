@@ -28,6 +28,8 @@ public:
     
     // Complete build pipeline (preprocess + save)
     bool build_and_save(const std::string& input_file, const std::string& output_file);
+    bool build_and_save_sampled(const std::string& input_file, const std::string& output_file,
+                                double sample_fraction, int random_seed = 42);
 
     // Search operations
     std::pair<size_t, size_t> find_range(const std::vector<llama_token>& pattern) const;

@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <map>
 #include <random>
 #include <chrono>
 
@@ -200,9 +201,35 @@ int main(int argc, char** argv) {
     std::vector<llama_token> inp;
     inp = common_tokenize(ctx, params.prompt, true, true);
 
-    // Load suffix array
+    // Load suffix array based on size key
     SuffixArray suffix_array;
-    const std::string suffix_file = "C:/Users/Administrator/Documents/ngram-spec/outputs/code/magpie-code-suffix.bin";
+    std::string suffix_file;
+
+    // Get suffix array size from environment variable or default to "full"
+    std::string size_key = "01pct";
+    const char* size_env = std::getenv("SUFFIX_SIZE");
+    if (size_env) {
+        size_key = std::string(size_env);
+    }
+
+    // Map size key to file path
+    std::map<std::string, std::string> size_to_file = {
+        {"0001pct", "C:/Users/Administrator/Documents/ngram-spec/outputs/code/magpie-all-suffix-0001pct.bin"},
+        {"01pct",   "C:/Users/Administrator/Documents/ngram-spec/outputs/code/magpie-all-suffix-01pct.bin"},
+        {"10pct",   "C:/Users/Administrator/Documents/ngram-spec/outputs/code/magpie-all-suffix-10pct.bin"},
+        {"full",    "C:/Users/Administrator/Documents/ngram-spec/outputs/code/magpie-all-suffix-full.bin"}
+    };
+
+    // Check if size key is valid
+    if (size_to_file.find(size_key) == size_to_file.end()) {
+        LOG_ERR("Invalid suffix array size key: %s\n", size_key.c_str());
+        LOG_ERR("Valid sizes: 0001pct, 01pct, 10pct, full\n");
+        return 1;
+    }
+
+    suffix_file = size_to_file[size_key];
+    LOG_INF("Loading suffix array: %s (size: %s)\n", suffix_file.c_str(), size_key.c_str());
+
     if (!suffix_array.load_mmap(suffix_file)) {
         LOG_ERR("Failed to load suffix array from: %s\n", suffix_file.c_str());
         return 1;

@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <stdexcept>
 #include <set>
+#include <random>
+#include <numeric>
 
 // Platform-specific includes for memory mapping
 #ifdef _WIN32
@@ -558,5 +560,72 @@ bool SuffixArray::build_and_save(const std::string& input_file, const std::strin
     }
     
     std::cout << "=== Build Complete ===" << std::endl;
+    return true;
+}
+
+bool SuffixArray::build_and_save_sampled(const std::string& input_file, const std::string& output_file,
+                                         double sample_fraction, int random_seed) {
+    std::cout << "=== Building Suffix Array with Sampling ===" << std::endl;
+    std::cout << "Input: " << input_file << std::endl;
+    std::cout << "Output: " << output_file << std::endl;
+    std::cout << "Sample fraction: " << (sample_fraction * 100) << "%" << std::endl;
+    std::cout << "Random seed: " << random_seed << std::endl;
+    
+    // Step 1: Load raw tokens (full corpus)
+    if (!load_raw_tokens_with_header(input_file)) {
+        return false;
+    }
+    
+    size_t original_size = corpus.size();
+    std::cout << "Original corpus size: " << original_size << " tokens" << std::endl;
+    
+    // Step 2: Sample the corpus
+    if (sample_fraction < 1.0) {
+        std::cout << "Sampling corpus..." << std::endl;
+        
+        // Initialize random number generator
+        std::mt19937 rng(random_seed);
+        
+        // Calculate target size
+        size_t target_size = static_cast<size_t>(original_size * sample_fraction);
+        std::cout << "Target size: " << target_size << " tokens" << std::endl;
+        
+        // Create indices for all tokens
+        std::vector<size_t> indices(original_size);
+        std::iota(indices.begin(), indices.end(), 0);
+        
+        // Shuffle indices
+        std::shuffle(indices.begin(), indices.end(), rng);
+        
+        // Take first target_size indices and sort them to maintain relative order
+        indices.resize(target_size);
+        std::sort(indices.begin(), indices.end());
+        
+        // Create sampled corpus
+        std::vector<llama_token> sampled_corpus(target_size);
+        for (size_t i = 0; i < target_size; i++) {
+            sampled_corpus[i] = corpus[indices[i]];
+        }
+        
+        // Replace corpus with sampled version
+        corpus = std::move(sampled_corpus);
+        corpus_size = target_size;
+        
+        std::cout << "Sampled corpus size: " << corpus_size << " tokens" << std::endl;
+    } else {
+        std::cout << "Using full corpus (no sampling)" << std::endl;
+    }
+    
+    // Step 3: Build suffix array
+    if (!build_from_corpus(corpus)) {
+        return false;
+    }
+    
+    // Step 4: Save to file
+    if (!save(output_file)) {
+        return false;
+    }
+    
+    std::cout << "=== Sampled Build Complete ===" << std::endl;
     return true;
 }
