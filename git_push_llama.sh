@@ -8,7 +8,7 @@ while true; do
     echo "$(date): Attempting git push..."
     
     # Try to push
-    if git push origin main mac-dev; then
+    if git push origin mac-dev; then
         echo "$(date): Push successful!"
         # Exit the loop on success
         break
