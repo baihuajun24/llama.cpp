@@ -215,6 +215,9 @@ int main(int argc, char** argv) {
     std::vector<llama_token> draft;
     llama_batch batch_tgt = llama_batch_init(params.n_ctx, 0, 1);
     
+    // Track the source of the current draft tokens (for proper attribution)
+    std::string current_draft_source = "X";  // First iteration has no draft
+    
     const auto t_dec_start = ggml_time_us();
     
     while (true) {
@@ -308,22 +311,25 @@ int main(int argc, char** argv) {
         int match_n = 0;
         std::string source = "X";
         
-        // Try to get draft tokens from the static ngram table
+        // Try to get draft tokens using PS (Prompt Search + Static table) approach
         if (table_loaded) {
-            ng_table.draft(inp, draft, n_draft, table_params.ngram_min, table_params.ngram_max);
-            // Simple heuristic: if draft size increased, we found a match
-            if (draft.size() > original_draft_size) {
-                match_n = 1; // Simplified match tracking
-                source = "S"; // From static table; 0714 temporary usage for static only
-            }
+            auto result = ng_table.interleave_draft(inp, draft, n_draft, table_params.ngram_min, table_params.ngram_max);
+            match_n = result.first;  // Get actual n-gram match length
+            // 将结果的source字符转换为字符串
+            source = std::string(1, result.second);  // 'P'/'S'/'X' -> "P"/"S"/"X"
+            current_draft_source = source;
+        } else {
+            // 无表格加载时使用默认值
+            source = current_draft_source = "X";
         }
         
         const int64_t t_end_draft_us = ggml_time_us();
         const int64_t draft_time_us = t_end_draft_us - t_start_draft_us;
         
         // Record metrics: match_n, accept_length, draft_size, draft_time_us, verify_time_us, source
+        // Use current_draft_source for correct attribution of accepted tokens
         verify_list.emplace_back(match_n, accept_length, draft.size() - original_draft_size, 
-                                draft_time_us, verify_time_us, source);
+                                draft_time_us, verify_time_us, current_draft_source);
         
         t_draft_us += draft_time_us;
         n_drafted += draft.size() - 1;

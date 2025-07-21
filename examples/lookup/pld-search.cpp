@@ -23,10 +23,33 @@ int common_ngram_cache_draft(const std::vector<llama_token> & search_space,
                               int n_draft,
                               int ngram_min,
                               int ngram_max) {
-    const int search_size = search_space.size();
+    const size_t search_size = search_space.size(); // 0720 overflow
     const int match_size = match_key.size();
 
+    // // 添加调试输出检查溢出
+    // LOG_INF("=== Debug common_ngram_cache_draft ===\n");
+    // LOG_INF("search_space.size() = %zu\n", search_space.size());
+    // LOG_INF("search_size (int) = %zu\n", search_size);
+    // LOG_INF("match_size = %d\n", match_size);
+    // LOG_INF("ngram_min = %d, ngram_max = %d\n", ngram_min, ngram_max);
+    
+    // // 检查是否发生溢出
+    // if (search_space.size() > INT_MAX) {
+    //     LOG_ERR("OVERFLOW: search_space.size() (%zu) > INT_MAX (%d)\n", 
+    //             search_space.size(), INT_MAX);
+    //     return 0;
+    // }
+    // 检查转换后的值是否合理
+
+    if (search_size < 0) {
+        LOG_ERR("❌ NEGATIVE: search_size = %d (原始size = %zu)\n", 
+                search_size, search_space.size());
+        return 0;
+    }
+
     if (match_size < ngram_min || search_size < ngram_min) {
+        LOG_INF("Early return: match_size=%d, search_size=%d, ngram_min=%d\n", 
+                match_size, search_size, ngram_min);
         return 0;
     }
 
@@ -223,13 +246,16 @@ std::pair<int, char> common_ngram_cache_interleave(const std::vector<llama_token
                                                   int ngram_min,
                                                   int ngram_max) {
     const int inp_size = inp.size();
-    const int static_size = static_cache.size();
+    const size_t static_size = static_cache.size();
 
-    if (inp_size < ngram_min || static_size < ngram_min) {
+    // 移除错误的负数检查
+    // size_t 永远不会小于0，这个检查没有意义
+    
+    if (inp_size < ngram_min || static_size < static_cast<size_t>(ngram_min)) {
         return {0, 'X'};
     }
 
-    // Create search space from prompt history (excluding last ngram_min tokens to avoid overlap)
+    // Create search space from prompt history
     std::vector<llama_token> search_space;
     if (inp_size > ngram_min) {
         search_space = std::vector<llama_token>(inp.begin(), inp.end() - ngram_min);
@@ -238,10 +264,9 @@ std::pair<int, char> common_ngram_cache_interleave(const std::vector<llama_token
     const int max_n = std::min(ngram_max, inp_size);
 
     for (int n = max_n; n >= ngram_min; --n) {
-        // Take the last n tokens of inp as query
         std::vector<llama_token> suffix(inp.end() - n, inp.end());
 
-        // First, try to find match in prompt history (search_space)
+        // Prompt history search (unchanged)
         if (!search_space.empty() && (int)search_space.size() >= n) {
             for (int i = 0; i <= (int)search_space.size() - n; ++i) {
                 bool match = true;
@@ -251,22 +276,22 @@ std::pair<int, char> common_ngram_cache_interleave(const std::vector<llama_token
                         break;
                     }
                 }
-
                 if (match) {
-                    // Draft up to n_draft tokens after the match from prompt history
                     for (int j = 0; j < n_draft && (i + n + j) < (int)search_space.size(); ++j) {
                         draft.push_back(search_space[i + n + j]);
                     }
-                    return {n, 'P'}; // Found in prompt
+                    return {n, 'P'};
                 }
             }
         }
 
-        // If not found in prompt history, try static cache with advanced selection
-        if (static_size >= n) {
-            // Find all match positions in static cache
-            std::vector<int> match_positions;
-            for (int i = 0; i <= static_size - n; ++i) {
+        // 🔧 修复静态缓存搜索
+        if (static_size >= static_cast<size_t>(n)) {
+            std::vector<size_t> match_positions;  // 改为 size_t
+            
+            // 修复循环边界计算
+            size_t max_search_pos = static_size - n;
+            for (size_t i = 0; i <= max_search_pos; ++i) {  // 使用 size_t
                 bool match = true;
                 for (int j = 0; j < n; ++j) {
                     if (static_cache[i + j] != suffix[j]) {
@@ -280,9 +305,9 @@ std::pair<int, char> common_ngram_cache_interleave(const std::vector<llama_token
             }
 
             if (!match_positions.empty()) {
-                // Check if any match position has valid continuation
+                // 检查是否有有效的延续
                 bool has_valid_continuation = false;
-                for (int pos : match_positions) {
+                for (size_t pos : match_positions) {
                     if (pos + n < static_size) {
                         has_valid_continuation = true;
                         break;
@@ -290,27 +315,58 @@ std::pair<int, char> common_ngram_cache_interleave(const std::vector<llama_token
                 }
 
                 if (has_valid_continuation) {
-                    // Use advanced selection for static cache
-                    std::vector<llama_token> best_candidate = select_best_candidate(static_cache, match_positions, n, n_draft);
+                    // 需要修改 select_best_candidate 以接受 size_t
+                    // 或者创建一个转换后的 int 版本（但要检查范围）
+                    std::vector<int> int_positions;
+                    for (size_t pos : match_positions) {
+                        if (pos <= INT_MAX) {
+                            int_positions.push_back(static_cast<int>(pos));
+                        }
+                    }
                     
-                    // Copy the best candidate to draft
-                    draft.insert(draft.end(), best_candidate.begin(), best_candidate.end());
-                    return {n, 'S'}; // Found in static cache
+                    if (!int_positions.empty()) {
+                        std::vector<llama_token> best_candidate = 
+                            select_best_candidate(static_cache, int_positions, n, n_draft);
+                        
+                        draft.insert(draft.end(), best_candidate.begin(), best_candidate.end());
+                        return {n, 'S'};
+                    }
                 }
             }
         }
     }
 
-    return {0, 'X'}; // No match found in either source
+    return {0, 'X'};
 }
 
 
 std::vector<llama_token> load_static_token_cache() {
     LOG_INF("[0528 start load_static_token_cache]");
-    const std::string file_path = "C:/Users/Administrator/Documents/ngram-spec/outputs/code/magpie-all-tokens.bin"; // enlarge dataset
-    //const std::string file_path = "D:/outputs/code/code-10G-tokens.bin";
+    
+    // Get file path from environment variable with fallback
+    std::string file_path = "C:/Users/Administrator/Documents/ngram-spec/outputs/code/magpie-all-tokens.bin";
+    const char* path_env = std::getenv("STATIC_CACHE_PATH");
+    if (path_env) {
+        file_path = std::string(path_env);
+    }
+    
+    // Get percentage from environment variable
+    double percentage = 100.0; // Default to 100%
+    const char* pct_env = std::getenv("STATIC_CACHE_PCT");
+    if (pct_env) {
+        try {
+            percentage = std::stod(pct_env);
+            if (percentage <= 0 || percentage > 100) {
+                LOG_ERR("[load_static_token_cache] Invalid STATIC_CACHE_PCT: %s (must be 0 < pct <= 100)\n", pct_env);
+                exit(1);
+            }
+        } catch (const std::exception& e) {
+            LOG_ERR("[load_static_token_cache] Invalid STATIC_CACHE_PCT format: %s\n", pct_env);
+            exit(1);
+        }
+    }
+    
     std::ifstream file(file_path, std::ios::binary);
-
     if (!file.is_open()) {
         LOG_ERR("[load_static_token_cache] Failed to open static token cache: %s\n", file_path.c_str());
         exit(1);
@@ -326,21 +382,27 @@ std::vector<llama_token> load_static_token_cache() {
         exit(1);
     }
 
-    size_t num_tokens = file_size / sizeof(int32_t);
-    std::vector<llama_token> tokens(num_tokens);
+    size_t total_tokens = file_size / sizeof(int32_t);
+    
+    // Calculate how many tokens to load based on percentage
+    size_t num_tokens_to_load = static_cast<size_t>((total_tokens * percentage) / 100.0);
+    
+    std::vector<llama_token> tokens(num_tokens_to_load);
 
-    file.read(reinterpret_cast<char*>(tokens.data()), file_size);
+    // Read only the specified percentage from the beginning
+    file.read(reinterpret_cast<char*>(tokens.data()), num_tokens_to_load * sizeof(int32_t));
     if (!file) {
-        LOG_ERR("[load_static_token_cache] Failed to read full token data from file: %s\n", file_path.c_str());
+        LOG_ERR("[load_static_token_cache] Failed to read token data from file: %s\n", file_path.c_str());
         exit(1);
     }
 
-    double disk_mb = file_size / (1024.0 * 1024.0);
-    double ram_mb  = (tokens.size() * sizeof(llama_token)) / (1024.0 * 1024.0);
+    double disk_mb_total = file_size / (1024.0 * 1024.0);
+    double ram_mb = (tokens.size() * sizeof(llama_token)) / (1024.0 * 1024.0);
 
     LOG_INF("[load_static_token_cache] Static token cache loaded\n");
-    LOG_INF("  Total tokens     : %zu\n", num_tokens);
-    LOG_INF("  Disk file size   : %.2f MB\n", disk_mb);
+    LOG_INF("  Percentage used  : %.1f%%\n", percentage);
+    LOG_INF("  Total tokens     : %zu (%.1f%% of %zu)\n", num_tokens_to_load, percentage, total_tokens);
+    LOG_INF("  Total file size  : %.2f MB\n", disk_mb_total);
     LOG_INF("  RAM usage        : %.2f MB\n", ram_mb);
     LOG_INF("  File path        : %s\n", file_path.c_str());
 
@@ -349,7 +411,8 @@ std::vector<llama_token> load_static_token_cache() {
 
 void test_pld_search(const std::vector<llama_token> & static_cache, llama_context * ctx) {
     // Define the test string
-    std::string test_string = "Given a list of temperatures";
+    std::string test_string = "from .models import";
+    // std::string test_string = "for i, temp in";
 
     // Tokenize the input string
     std::vector<llama_token> test_ids = common_tokenize(ctx, test_string, true, true);
@@ -366,7 +429,7 @@ void test_pld_search(const std::vector<llama_token> & static_cache, llama_contex
 
     // Search static cache with test_ids as input
     std::vector<llama_token> draft;
-    int match_n = common_ngram_cache_draft(static_cache, test_ids, draft, /*n_draft=*/10, /*ngram_min=*/2, /*ngram_max=*/6);
+    int match_n = common_ngram_cache_draft(static_cache, test_ids, draft, /*n_draft=*/10, /*ngram_min=*/1, /*ngram_max=*/6);
 
     LOG_INF("Match n-gram length: %d\n", match_n);
 
@@ -389,7 +452,8 @@ void test_pld_search(const std::vector<llama_token> & static_cache, llama_contex
         LOG_INF("Decoded draft: \"%s\"\n", decoded_draft.c_str());
     }
 
-    std::string target_string = "Given a list of temperatures in a week, determine the number of days it takes for the temperature to increase from a specific temperature to a higher temperature.";
+    // std::string target_string = "Given a list of temperatures in a week, determine the number of days it takes for the temperature to increase from a specific temperature to a higher temperature.";
+    std::string target_string = "from .models import (";
     std::vector<llama_token> target_ids = common_tokenize(ctx, target_string, true, true);
     LOG_INF("Target string: \"%s\"\n", target_string.c_str());
     // Print token IDs
@@ -400,7 +464,6 @@ void test_pld_search(const std::vector<llama_token> & static_cache, llama_contex
     }
     LOG("\n");
 }
-
 
 int main(int argc, char ** argv){
     common_params params;
@@ -438,13 +501,35 @@ int main(int argc, char ** argv){
     // load the static cache
     std::vector<llama_token> static_cache = load_static_token_cache();
 
-    // This is for testing
+    // // This is for testing
+    
+    // // Create a vector with first 1000 tokens for testing
+    // std::vector<llama_token> test_cache(static_cache.begin(), static_cache.begin() + std::min(static_cache.size(), size_t(1000)));
+
     // LOG_INF("V2: first 1000 tokens decode:\n");
     // std::string preview_text;
-    // for (size_t i = 0; i < std::min(static_cache.size(), size_t(1000)); ++i) {
-    //     preview_text += common_token_to_piece(ctx, static_cache[i]);
+    // for (size_t i = 0; i < test_cache.size(); ++i) {
+    //     preview_text += common_token_to_piece(ctx, test_cache[i]);
     // }
     // LOG("%s\n", preview_text.c_str());
+
+    // // 添加这部分：打印对应的token IDs
+    // LOG_INF("V2: first 1000 token IDs:\n");
+    // for (size_t i = 0; i < test_cache.size(); ++i) {
+    //     if (test_cache[i] == 255) {
+    //         LOG("*255* ");  // 特殊标记分隔符
+    //     } else {
+    //         LOG("%d ", test_cache[i]);
+    //     }
+        
+    //     // 每20个tokens换行，方便阅读
+    //     if ((i + 1) % 20 == 0) {
+    //         LOG("\n");
+    //     }
+    // }
+    // LOG("\n\n");
+
+    // test_pld_search(test_cache, ctx);
 
     // test_pld_search(static_cache, ctx);
     // return 0;
@@ -613,9 +698,12 @@ int main(int argc, char ** argv){
         // std::vector<llama_token> search_space;
 
         // Use interleaved search: prompt first, then static cache for each n-gram length
-        auto result = common_ngram_cache_interleave(static_cache, inp, draft, n_draft, params.ngram_min, params.ngram_max); // use a larger ngram_max to test performance
-        match_n = result.first;
-        source = std::string(1, result.second); 
+        // auto result = common_ngram_cache_interleave(static_cache, inp, draft, n_draft, params.ngram_min, params.ngram_max); // use a larger ngram_max to test performance
+        // match_n = result.first;
+        // source = std::string(1, result.second); 
+
+        match_n = common_ngram_cache_draft(static_cache, inp, draft, n_draft, params.ngram_min, params.ngram_max);
+        source = "S";
 
         // // Search draft in prompt+answer first
         // if (inp.size() > params.ngram_min) {
