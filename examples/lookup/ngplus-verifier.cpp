@@ -581,8 +581,10 @@ static void trace_step(
         const std::string & sampled_piece,
         const std::string & previous_sampled_piece,
         const std::string & generated_prefix,
+        const std::string & generated_token_ids,
         const std::string & generated_token_ids_prefix,
         const std::string & generated_token_ids_tail,
+        const std::string & generated_token_pieces,
         const std::string & generated_token_pieces_prefix,
         const std::string & generated_token_pieces_tail,
         const std::string & top_candidates) {
@@ -641,8 +643,10 @@ static void trace_step(
           << "\"sampled_piece\":\"" << json_escape(sampled_piece) << "\","
           << "\"previous_sampled_piece\":\"" << json_escape(previous_sampled_piece) << "\","
           << "\"generated_prefix\":\"" << json_escape(generated_prefix) << "\","
+          << "\"generated_token_ids\":" << generated_token_ids << ","
           << "\"generated_token_ids_prefix\":" << generated_token_ids_prefix << ","
           << "\"generated_token_ids_tail\":" << generated_token_ids_tail << ","
+          << "\"generated_token_pieces\":" << generated_token_pieces << ","
           << "\"generated_token_pieces_prefix\":" << generated_token_pieces_prefix << ","
           << "\"generated_token_pieces_tail\":" << generated_token_pieces_tail << ","
           << "\"top_candidates\":" << top_candidates
@@ -900,8 +904,10 @@ int main(int argc, char ** argv) {
             llama_vocab_is_eog(vocab, id) ? std::string() : common_token_to_piece(ctx, id),
             previous_sampled_piece,
             string_prefix(generated_text.str(), 256),
+            token_ids_json(generated_token_ids, 0, generated_token_ids.size()),
             token_ids_prefix_json(generated_token_ids, 32),
             token_ids_tail_json(generated_token_ids, 16),
+            token_pieces_json(ctx, generated_token_ids, 0, generated_token_ids.size()),
             token_pieces_prefix_json(ctx, generated_token_ids, 32),
             token_pieces_tail_json(ctx, generated_token_ids, 16),
             top_candidates);
