@@ -46,6 +46,9 @@ struct ngplus_params {
     int prompt_tokens = 0;
     int prompt_bytes = 0;
     std::string prompt_fingerprint;
+    std::string prompt_token_head_json = "[]";
+    std::string prompt_token_tail_json = "[]";
+    std::string prompt_suffix;
     std::string chat_generation_prompt;
     bool chat_grammar_lazy = false;
     int reasoning_budget_start_tokens = 0;
@@ -346,6 +349,39 @@ static std::string json_float_or_null(float value) {
     return out.str();
 }
 
+static std::string token_ids_json(
+        const std::vector<llama_token> & tokens,
+        size_t begin,
+        size_t end) {
+    std::ostringstream out;
+    out << "[";
+    const size_t n = tokens.size();
+    begin = std::min(begin, n);
+    end = std::min(end, n);
+    for (size_t i = begin; i < end; ++i) {
+        if (i > begin) {
+            out << ",";
+        }
+        out << tokens[i];
+    }
+    out << "]";
+    return out.str();
+}
+
+static std::string string_suffix(const std::string & input, size_t max_bytes) {
+    if (input.size() <= max_bytes) {
+        return input;
+    }
+    return input.substr(input.size() - max_bytes);
+}
+
+static std::string string_prefix(const std::string & input, size_t max_bytes) {
+    if (input.size() <= max_bytes) {
+        return input;
+    }
+    return input.substr(0, max_bytes);
+}
+
 #ifdef NGPLUS_USE_UPSTREAM_GEMMA4
 static std::string top_candidates_json(
         llama_context * ctx,
@@ -495,7 +531,10 @@ static void trace_step(
         int64_t kv_cleanup_us,
         int output_tokens_total,
         llama_token sampled_token,
+        llama_token previous_sampled_token,
         const std::string & sampled_piece,
+        const std::string & previous_sampled_piece,
+        const std::string & generated_prefix,
         const std::string & top_candidates) {
     if (!trace.is_open()) {
         return;
@@ -513,6 +552,9 @@ static void trace_step(
           << "\"prompt_tokens\":" << ngp.prompt_tokens << ","
           << "\"prompt_bytes\":" << ngp.prompt_bytes << ","
           << "\"prompt_fingerprint\":\"" << ngp.prompt_fingerprint << "\","
+          << "\"prompt_token_head\":" << ngp.prompt_token_head_json << ","
+          << "\"prompt_token_tail\":" << ngp.prompt_token_tail_json << ","
+          << "\"prompt_suffix\":\"" << json_escape(ngp.prompt_suffix) << "\","
           << "\"chat_generation_prompt\":\"" << json_escape(ngp.chat_generation_prompt) << "\","
           << "\"chat_grammar_lazy\":" << (ngp.chat_grammar_lazy ? "true" : "false") << ","
           << "\"reasoning_budget_start_tokens\":" << ngp.reasoning_budget_start_tokens << ","
@@ -543,7 +585,10 @@ static void trace_step(
           << "\"kv_cleanup_us\":" << kv_cleanup_us << ","
           << "\"output_tokens_total\":" << output_tokens_total << ","
           << "\"sampled_token\":" << sampled_token << ","
+          << "\"previous_sampled_token\":" << previous_sampled_token << ","
           << "\"sampled_piece\":\"" << json_escape(sampled_piece) << "\","
+          << "\"previous_sampled_piece\":\"" << json_escape(previous_sampled_piece) << "\","
+          << "\"generated_prefix\":\"" << json_escape(generated_prefix) << "\","
           << "\"top_candidates\":" << top_candidates
           << "}\n";
 }
@@ -630,6 +675,9 @@ int main(int argc, char ** argv) {
     ngp.prompt_tokens = (int) history.size();
     ngp.prompt_bytes = (int) params.prompt.size();
     ngp.prompt_fingerprint = fnv1a64_hex(params.prompt);
+    ngp.prompt_token_head_json = token_ids_json(history, 0, std::min<size_t>(16, history.size()));
+    ngp.prompt_token_tail_json = token_ids_json(history, history.size() > 16 ? history.size() - 16 : 0, history.size());
+    ngp.prompt_suffix = string_suffix(params.prompt, 512);
     ngp.chat_generation_prompt = params.sampling.generation_prompt;
 
     const int64_t t_hot_init_start_us = ggml_time_us();
@@ -715,6 +763,8 @@ int main(int argc, char ** argv) {
 
     const auto t_dec_start = ggml_time_us();
     int step = 0;
+    llama_token previous_sampled_token = -1;
+    std::string previous_sampled_piece;
 
     while (!has_eos && (params.n_predict < 0 || n_predict < params.n_predict)) {
         const int remaining = params.n_predict < 0 ? n_draft : std::max(1, params.n_predict - n_predict);
@@ -786,8 +836,13 @@ int main(int argc, char ** argv) {
             kv_cleanup_us,
             n_predict,
             id,
+            previous_sampled_token,
             llama_vocab_is_eog(vocab, id) ? std::string() : common_token_to_piece(ctx, id),
+            previous_sampled_piece,
+            string_prefix(generated_text.str(), 256),
             top_candidates);
+        previous_sampled_token = id;
+        previous_sampled_piece = llama_vocab_is_eog(vocab, id) ? std::string() : common_token_to_piece(ctx, id);
     }
 
     const auto t_dec_end = ggml_time_us();
