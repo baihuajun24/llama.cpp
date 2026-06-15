@@ -61,6 +61,7 @@ struct ngplus_params {
     std::string prompt_token_tail_json = "[]";
     std::string prompt_token_head_pieces_json = "[]";
     std::string prompt_token_tail_pieces_json = "[]";
+    std::string prompt_text;
     std::string prompt_suffix;
     std::string chat_generation_prompt;
     bool chat_grammar_lazy = false;
@@ -848,6 +849,8 @@ static void trace_step(
           << "\"prompt_token_head_pieces\":" << ngp.prompt_token_head_pieces_json << ","
           << "\"prompt_token_tail_pieces\":" << ngp.prompt_token_tail_pieces_json << ","
           << "\"prompt_suffix\":\"" << json_escape(ngp.prompt_suffix) << "\","
+          << "\"prompt_text_final\":"
+          << (generated_full_sequence_final ? ("\"" + json_escape(ngp.prompt_text) + "\"") : "null") << ","
           << "\"chat_generation_prompt\":\"" << json_escape(ngp.chat_generation_prompt) << "\","
           << "\"chat_grammar_lazy\":" << (ngp.chat_grammar_lazy ? "true" : "false") << ","
           << "\"reasoning_budget_start_tokens\":" << ngp.reasoning_budget_start_tokens << ","
@@ -1043,6 +1046,7 @@ int main(int argc, char ** argv) {
     ngp.prompt_token_tail_json = token_ids_json(history, history.size() > 16 ? history.size() - 16 : 0, history.size());
     ngp.prompt_token_head_pieces_json = token_pieces_json(ctx, history, 0, std::min<size_t>(16, history.size()));
     ngp.prompt_token_tail_pieces_json = token_pieces_json(ctx, history, history.size() > 16 ? history.size() - 16 : 0, history.size());
+    ngp.prompt_text = params.prompt;
     ngp.prompt_suffix = string_suffix(params.prompt, 512);
     ngp.chat_generation_prompt = params.sampling.generation_prompt;
 
