@@ -37,6 +37,7 @@ struct ngplus_params {
     bool single_turn = true;
     bool chat_template_applied = false;
     bool prompt_sampler_seeded = false;
+    bool server_backend_sampling = false;
     bool draft_acceptance_enabled = false;
     bool no_display_prompt = false;
 };
@@ -417,6 +418,7 @@ static void trace_step(
           << "\"cold_mmap\":\"" << json_escape(ngp.cold_mmap) << "\","
           << "\"prompt_format\":\"" << (ngp.chat_template_applied ? "chat-single-turn" : "raw") << "\","
           << "\"prompt_sampler_seeded\":" << (ngp.prompt_sampler_seeded ? "true" : "false") << ","
+          << "\"server_backend_sampling\":" << (ngp.server_backend_sampling ? "true" : "false") << ","
           << "\"verification_mode\":\"ar_exact_prefill_diagnostic_draft\","
           << "\"draft_acceptance_enabled\":" << (ngp.draft_acceptance_enabled ? "true" : "false") << ","
           << "\"device_fallback\":" << (ngp.cpu_fallback ? "\"cpu_no_usable_offload_device\"" : "null") << ","
@@ -557,10 +559,16 @@ int main(int argc, char ** argv) {
     std::stringstream generated_text;
     struct common_sampler * smpl = common_sampler_init(model, params.sampling);
     common_sampler_reset(smpl);
-    for (llama_token id : history) {
-        common_sampler_accept(smpl, id, false);
+
+#ifdef NGPLUS_USE_UPSTREAM_GEMMA4
+    // llama-server attaches the sampler before prompt decode, then resets and
+    // seeds it after prompt decode. Mirroring that preserves the first-token
+    // backend-sampling surface used by the fixed server baseline.
+    ngp.server_backend_sampling = llama_set_sampler(ctx, 0, common_sampler_get(smpl));
+    if (!ngp.server_backend_sampling) {
+        LOG_WRN("ngplus: failed to attach server-aligned backend sampler; falling back to host sampling\n");
     }
-    ngp.prompt_sampler_seeded = true;
+#endif
 
     const int batch_capacity = std::max(
         (int) llama_n_batch(ctx),
@@ -580,6 +588,12 @@ int main(int argc, char ** argv) {
         return 1;
     }
     const auto t_enc_end = ggml_time_us();
+
+    common_sampler_reset(smpl);
+    for (llama_token id : history) {
+        common_sampler_accept(smpl, id, false);
+    }
+    ngp.prompt_sampler_seeded = true;
 
     int n_past = (int) history.size();
 
