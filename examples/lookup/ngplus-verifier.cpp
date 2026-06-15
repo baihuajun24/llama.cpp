@@ -47,6 +47,10 @@ struct ngplus_params {
     int prompt_bytes = 0;
     std::string prompt_fingerprint;
     std::string chat_generation_prompt;
+    bool chat_grammar_lazy = false;
+    int reasoning_budget_start_tokens = 0;
+    int reasoning_budget_end_tokens = 0;
+    int reasoning_budget_forced_tokens = 0;
     std::string sampler_chain;
 };
 
@@ -375,7 +379,7 @@ static std::string top_candidates_json(
 #endif
 
 #ifdef NGPLUS_USE_UPSTREAM_GEMMA4
-static bool apply_single_turn_chat_template(common_params & params, llama_model * model) {
+static bool apply_single_turn_chat_template(common_params & params, llama_model * model, ngplus_params & ngp) {
     if (model == nullptr || params.prompt.empty()) {
         return false;
     }
@@ -400,7 +404,31 @@ static bool apply_single_turn_chat_template(common_params & params, llama_model 
 
     const common_chat_params chat_params = common_chat_templates_apply(chat_templates.get(), inputs);
     params.prompt = chat_params.prompt;
+    if (!chat_params.grammar.empty()) {
+        params.sampling.grammar = common_grammar(COMMON_GRAMMAR_TYPE_TOOL_CALLS, chat_params.grammar);
+    }
+    params.sampling.grammar_lazy = chat_params.grammar_lazy;
+    params.sampling.grammar_triggers = chat_params.grammar_triggers;
+    params.sampling.preserved_tokens.clear();
+    for (const auto & token : chat_params.preserved_tokens) {
+        const auto tokenized = common_tokenize(llama_model_get_vocab(model), token, false, true);
+        params.sampling.preserved_tokens.insert(tokenized.begin(), tokenized.end());
+    }
     params.sampling.generation_prompt = chat_params.generation_prompt;
+    if (!chat_params.thinking_end_tag.empty()) {
+        const llama_vocab * vocab = llama_model_get_vocab(model);
+        params.sampling.reasoning_budget_start = common_tokenize(vocab, chat_params.thinking_start_tag, false, true);
+        params.sampling.reasoning_budget_end = common_tokenize(vocab, chat_params.thinking_end_tag, false, true);
+        params.sampling.reasoning_budget_forced = common_tokenize(
+            vocab,
+            params.sampling.reasoning_budget_message + chat_params.thinking_end_tag,
+            false,
+            true);
+    }
+    ngp.chat_grammar_lazy = chat_params.grammar_lazy;
+    ngp.reasoning_budget_start_tokens = (int) params.sampling.reasoning_budget_start.size();
+    ngp.reasoning_budget_end_tokens = (int) params.sampling.reasoning_budget_end.size();
+    ngp.reasoning_budget_forced_tokens = (int) params.sampling.reasoning_budget_forced.size();
 
     return true;
 }
@@ -486,6 +514,10 @@ static void trace_step(
           << "\"prompt_bytes\":" << ngp.prompt_bytes << ","
           << "\"prompt_fingerprint\":\"" << ngp.prompt_fingerprint << "\","
           << "\"chat_generation_prompt\":\"" << json_escape(ngp.chat_generation_prompt) << "\","
+          << "\"chat_grammar_lazy\":" << (ngp.chat_grammar_lazy ? "true" : "false") << ","
+          << "\"reasoning_budget_start_tokens\":" << ngp.reasoning_budget_start_tokens << ","
+          << "\"reasoning_budget_end_tokens\":" << ngp.reasoning_budget_end_tokens << ","
+          << "\"reasoning_budget_forced_tokens\":" << ngp.reasoning_budget_forced_tokens << ","
           << "\"prompt_sampler_seeded\":" << (ngp.prompt_sampler_seeded ? "true" : "false") << ","
           << "\"backend_sampling_requested\":" << (ngp.backend_sampling_requested ? "true" : "false") << ","
           << "\"server_backend_sampling\":" << (ngp.server_backend_sampling ? "true" : "false") << ","
@@ -577,7 +609,7 @@ int main(int argc, char ** argv) {
         try {
             params.enable_reasoning = 0;
             params.default_template_kwargs["enable_thinking"] = "false";
-            ngp.chat_template_applied = apply_single_turn_chat_template(params, model);
+            ngp.chat_template_applied = apply_single_turn_chat_template(params, model, ngp);
         } catch (const std::exception & e) {
             LOG_ERR("failed to apply single-turn chat template for NG+ verification: %s\n", e.what());
             llama_backend_free();
