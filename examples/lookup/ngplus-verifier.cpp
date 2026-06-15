@@ -37,6 +37,7 @@ struct ngplus_params {
     std::string reference_prompt_json_arg;
     std::vector<llama_token> reference_token_ids;
     bool stop_after_reference_mismatch = false;
+    bool force_reference_tokens = false;
     int reference_text_bytes = 0;
     std::string reference_text_fnv1a64;
     std::string reference_source = "none";
@@ -120,6 +121,8 @@ static void print_ngplus_usage(int, char **) {
     printf("                                optional server /apply-template JSON; extracts prompt for trace diagnostics\n");
     printf("  --ngplus-stop-after-reference-mismatch\n");
     printf("                                stop reference replay after the first mismatching generated token\n");
+    printf("  --ngplus-force-reference-tokens\n");
+    printf("                                diagnostic replay: accept reference tokens when present in sampler candidates\n");
 }
 
 static std::string require_value(int argc, char ** argv, int & i, const std::string & arg) {
@@ -286,6 +289,8 @@ static std::vector<std::string> preprocess_args(int argc, char ** argv, ngplus_p
             ngp.reference_prompt_json_arg = value_for(name);
         } else if (name == "--ngplus-stop-after-reference-mismatch") {
             ngp.stop_after_reference_mismatch = true;
+        } else if (name == "--ngplus-force-reference-tokens") {
+            ngp.force_reference_tokens = true;
         } else if (name == "-o" || name == "--output" || name == "--output-file") {
             ngp.out_file = value_for(name);
         } else if (name == "--no-display-prompt") {
@@ -753,6 +758,24 @@ static std::string reference_candidate_json(
         << "}";
     return out.str();
 }
+
+static int reference_candidate_rank(common_sampler * smpl, llama_token reference_token) {
+    if (reference_token < 0) {
+        return -1;
+    }
+
+    llama_token_data_array * candidates = common_sampler_get_candidates(smpl, true);
+    if (candidates == nullptr) {
+        return -1;
+    }
+
+    for (size_t i = 0; i < candidates->size; ++i) {
+        if (candidates->data[i].id == reference_token) {
+            return (int) i + 1;
+        }
+    }
+    return -1;
+}
 #endif
 
 #ifdef NGPLUS_USE_UPSTREAM_GEMMA4
@@ -896,6 +919,10 @@ static void trace_step(
         const std::string & generated_token_pieces_prefix,
         const std::string & generated_token_pieces_tail,
         const std::string & top_candidates,
+        llama_token sampler_selected_token,
+        const std::string & sampler_selected_piece,
+        bool reference_forced,
+        int reference_forced_rank,
         const std::string & reference_source,
         int reference_token_count,
         int reference_text_bytes,
@@ -997,6 +1024,13 @@ static void trace_step(
           << "\"generated_token_pieces_tail\":" << generated_token_pieces_tail << ","
           << "\"reference_source\":\"" << json_escape(reference_source) << "\","
           << "\"reference_stop_after_mismatch\":" << (ngp.stop_after_reference_mismatch ? "true" : "false") << ","
+          << "\"reference_force_enabled\":" << (ngp.force_reference_tokens ? "true" : "false") << ","
+          << "\"reference_forced\":" << (reference_forced ? "true" : "false") << ","
+          << "\"reference_forced_rank\":"
+          << (reference_forced_rank >= 0 ? std::to_string(reference_forced_rank) : "null") << ","
+          << "\"sampler_selected_token\":" << token_json_or_null(sampler_selected_token) << ","
+          << "\"sampler_selected_piece\":"
+          << (sampler_selected_piece.empty() ? "null" : ("\"" + json_escape(sampler_selected_piece) + "\"")) << ","
           << "\"reference_token_count\":" << reference_token_count << ","
           << "\"reference_text_bytes\":" << reference_text_bytes << ","
           << "\"reference_text_fnv1a64\":"
@@ -1272,8 +1306,23 @@ int main(int argc, char ** argv) {
         if (generated_token_ids.size() < ngp.reference_token_ids.size()) {
             reference_current_token = ngp.reference_token_ids[generated_token_ids.size()];
         }
-        const llama_token id = common_sampler_sample(smpl, ctx, -1);
+        llama_token id = common_sampler_sample(smpl, ctx, -1);
+        const llama_token sampler_selected_token = id;
+        const std::string sampler_selected_piece =
+            llama_vocab_is_eog(vocab, sampler_selected_token) ?
+                std::string() :
+                common_token_to_piece(ctx, sampler_selected_token);
+        int reference_forced_rank = -1;
+        bool reference_forced = false;
 #ifdef NGPLUS_USE_UPSTREAM_GEMMA4
+        reference_forced_rank = reference_candidate_rank(smpl, reference_current_token);
+        if (ngp.force_reference_tokens &&
+                reference_current_token >= 0 &&
+                reference_forced_rank >= 0 &&
+                reference_current_token != id) {
+            id = reference_current_token;
+            reference_forced = true;
+        }
         const std::string top_candidates = top_candidates_json(ctx, smpl, 5, id);
         const std::string reference_current_candidate =
             reference_candidate_json(ctx, smpl, reference_current_token, id);
@@ -1391,6 +1440,10 @@ int main(int argc, char ** argv) {
             token_pieces_prefix_json(ctx, generated_token_ids, 32),
             token_pieces_tail_json(ctx, generated_token_ids, 16),
             top_candidates,
+            sampler_selected_token,
+            sampler_selected_piece,
+            reference_forced,
+            reference_forced_rank,
             ngp.reference_source,
             (int) ngp.reference_token_ids.size(),
             ngp.reference_text_bytes,
