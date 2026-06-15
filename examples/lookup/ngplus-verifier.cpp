@@ -799,7 +799,9 @@ static void trace_step(
         int reference_text_bytes,
         int reference_first_mismatch_index,
         llama_token reference_expected_token,
+        llama_token reference_actual_token,
         const std::string & reference_expected_piece,
+        const std::string & reference_actual_piece,
         bool reference_prefix_matches,
         bool reference_final_matches,
         bool generated_full_sequence_final) {
@@ -885,6 +887,9 @@ static void trace_step(
           << "\"reference_expected_token\":" << token_json_or_null(reference_expected_token) << ","
           << "\"reference_expected_piece\":"
           << (reference_expected_piece.empty() ? "null" : ("\"" + json_escape(reference_expected_piece) + "\"")) << ","
+          << "\"reference_actual_token\":" << token_json_or_null(reference_actual_token) << ","
+          << "\"reference_actual_piece\":"
+          << (reference_actual_piece.empty() ? "null" : ("\"" + json_escape(reference_actual_piece) + "\"")) << ","
           << "\"top_candidates\":" << top_candidates
           << "}\n";
 }
@@ -1172,15 +1177,21 @@ int main(int argc, char ** argv) {
             reference_prefix_matches &&
             generated_token_ids.size() == ngp.reference_token_ids.size();
         llama_token reference_expected_token = -1;
+        llama_token reference_actual_token = -1;
         if (has_reference) {
             const size_t expected_index =
                 reference_first_mismatch >= 0 ? (size_t) reference_first_mismatch : generated_token_ids.size();
             if (expected_index < ngp.reference_token_ids.size()) {
                 reference_expected_token = ngp.reference_token_ids[expected_index];
             }
+            if (reference_first_mismatch >= 0 && (size_t) reference_first_mismatch < generated_token_ids.size()) {
+                reference_actual_token = generated_token_ids[reference_first_mismatch];
+            }
         }
         const std::string reference_expected_piece =
             reference_expected_token >= 0 ? common_token_to_piece(ctx, reference_expected_token) : std::string();
+        const std::string reference_actual_piece =
+            reference_actual_token >= 0 ? common_token_to_piece(ctx, reference_actual_token) : std::string();
 
         trace_step(
             trace,
@@ -1218,7 +1229,9 @@ int main(int argc, char ** argv) {
             ngp.reference_text_bytes,
             reference_first_mismatch,
             reference_expected_token,
+            reference_actual_token,
             reference_expected_piece,
+            reference_actual_piece,
             reference_prefix_matches,
             reference_final_matches,
             generated_full_sequence_final);
