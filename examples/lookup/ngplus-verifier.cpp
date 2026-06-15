@@ -692,6 +692,107 @@ static std::string string_prefix(const std::string & input, size_t max_bytes) {
 }
 
 #ifdef NGPLUS_USE_UPSTREAM_GEMMA4
+static std::string raw_logit_surface_json(
+        llama_context * ctx,
+        const llama_vocab * vocab,
+        llama_token reference_token,
+        int fingerprint_items) {
+    const float * logits = llama_get_logits_ith(ctx, -1);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    if (logits == nullptr || n_vocab <= 0) {
+        return "{\"candidate_count\":0,\"top_tokens\":[],\"top_logit\":null,\"second_logit\":null,\"top_margin\":null,\"fingerprint_items\":0,\"fingerprint_fnv1a64\":null,\"reference_raw_candidate\":null}";
+    }
+
+    const int n_items = std::max(0, std::min(fingerprint_items, n_vocab));
+    std::vector<llama_token_data> top;
+    top.reserve(n_vocab);
+
+    int reference_rank = -1;
+    float reference_logit = NAN;
+    for (llama_token token = 0; token < n_vocab; ++token) {
+        const float logit = logits[token];
+        top.push_back(llama_token_data{ token, logit, 0.0f });
+        if (token == reference_token) {
+            reference_logit = logit;
+        }
+    }
+
+    const auto by_logit_desc = [](const llama_token_data & a, const llama_token_data & b) {
+        if (a.logit == b.logit) {
+            return a.id < b.id;
+        }
+        return a.logit > b.logit;
+    };
+    if (n_items < (int) top.size()) {
+        std::partial_sort(top.begin(), top.begin() + n_items, top.end(), by_logit_desc);
+    } else {
+        std::sort(top.begin(), top.end(), by_logit_desc);
+    }
+
+    if (reference_token >= 0) {
+        reference_rank = 1;
+        for (const llama_token_data & item : top) {
+            if (item.id == reference_token) {
+                break;
+            }
+            if (item.logit > reference_logit || (item.logit == reference_logit && item.id < reference_token)) {
+                ++reference_rank;
+            }
+        }
+    }
+
+    const float top_logit = top.empty() ? NAN : top[0].logit;
+    const float second_logit = top.size() > 1 ? top[1].logit : NAN;
+    const float top_margin = top.size() > 1 ? top_logit - second_logit : NAN;
+
+    std::ostringstream payload;
+    payload << std::setprecision(9);
+    std::ostringstream top_tokens;
+    top_tokens << "[";
+    std::ostringstream top_logits;
+    top_logits << "[";
+    for (int i = 0; i < n_items; ++i) {
+        const llama_token_data & candidate = top[i];
+        if (i > 0) {
+            top_tokens << ",";
+            top_logits << ",";
+            payload << ";";
+        }
+        top_tokens << candidate.id;
+        top_logits << json_float_or_null(candidate.logit);
+        payload << candidate.id << ":" << candidate.logit;
+    }
+    top_tokens << "]";
+    top_logits << "]";
+
+    std::ostringstream reference_json;
+    if (reference_token >= 0) {
+        reference_json
+            << "{"
+            << "\"id\":" << reference_token << ","
+            << "\"piece\":\"" << json_escape(common_token_to_piece(ctx, reference_token)) << "\","
+            << "\"rank\":" << reference_rank << ","
+            << "\"logit\":" << json_float_or_null(reference_logit)
+            << "}";
+    } else {
+        reference_json << "null";
+    }
+
+    std::ostringstream out;
+    out << "{"
+        << "\"candidate_count\":" << n_vocab << ","
+        << "\"top_tokens\":" << top_tokens.str() << ","
+        << "\"top_logits\":" << top_logits.str() << ","
+        << "\"top_logit\":" << json_float_or_null(top_logit) << ","
+        << "\"second_logit\":" << json_float_or_null(second_logit) << ","
+        << "\"top_margin\":" << json_float_or_null(top_margin) << ","
+        << "\"fingerprint_items\":" << n_items << ","
+        << "\"fingerprint_fnv1a64\":\"" << fnv1a64_hex(payload.str()) << "\","
+        << "\"reference_raw_candidate\":" << reference_json.str()
+        << "}";
+    return out.str();
+}
+
 static std::string top_candidates_json(
         llama_context * ctx,
         common_sampler * smpl,
@@ -1014,6 +1115,7 @@ static void trace_step(
         const std::string & top_candidates,
         const std::string & sampler_diagnostics,
         const std::string & logit_surface,
+        const std::string & raw_logit_surface,
         llama_token sampler_selected_token,
         const std::string & sampler_selected_piece,
         bool reference_forced,
@@ -1073,6 +1175,7 @@ static void trace_step(
           << "\"sampler_chain\":\"" << json_escape(ngp.sampler_chain) << "\","
           << "\"sampler_diagnostics\":" << sampler_diagnostics << ","
           << "\"logit_surface\":" << logit_surface << ","
+          << "\"raw_logit_surface\":" << raw_logit_surface << ","
           << "\"verification_mode\":\"ar_exact_prefill_diagnostic_draft\","
           << "\"draft_acceptance_enabled\":" << (ngp.draft_acceptance_enabled ? "true" : "false") << ","
           << "\"device_fallback\":" << (ngp.cpu_fallback ? "\"cpu_no_usable_offload_device\"" : "null") << ","
@@ -1424,12 +1527,14 @@ int main(int argc, char ** argv) {
         const std::string sampler_diagnostics =
             sampler_diagnostics_json(smpl, params.sampling, sampler_selected_token);
         const std::string logit_surface = logit_surface_json(smpl, 32);
+        const std::string raw_logit_surface = raw_logit_surface_json(ctx, vocab, reference_current_token, 32);
         const std::string reference_current_candidate =
             reference_candidate_json(ctx, smpl, reference_current_token, id);
 #else
         const std::string top_candidates = "[]";
         const std::string sampler_diagnostics = "null";
         const std::string logit_surface = "null";
+        const std::string raw_logit_surface = "null";
         const std::string reference_current_candidate = "null";
 #endif
         common_sampler_accept(smpl, id, true);
@@ -1544,6 +1649,7 @@ int main(int argc, char ** argv) {
             top_candidates,
             sampler_diagnostics,
             logit_surface,
+            raw_logit_surface,
             sampler_selected_token,
             sampler_selected_piece,
             reference_forced,
