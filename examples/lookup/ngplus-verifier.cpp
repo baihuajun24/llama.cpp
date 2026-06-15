@@ -776,6 +776,57 @@ static int reference_candidate_rank(common_sampler * smpl, llama_token reference
     }
     return -1;
 }
+
+static std::string sampler_diagnostics_json(
+        common_sampler * smpl,
+        const common_params_sampling & sampling,
+        llama_token selected) {
+    llama_token_data_array * candidates = common_sampler_get_candidates(smpl, true);
+    int selected_index = -1;
+    float selected_logit = NAN;
+    float selected_p = NAN;
+    llama_token top_token = -1;
+    float top_logit = NAN;
+    float top_p = NAN;
+
+    if (candidates != nullptr && candidates->size > 0) {
+        top_token = candidates->data[0].id;
+        top_logit = candidates->data[0].logit;
+        top_p = candidates->data[0].p;
+        for (size_t i = 0; i < candidates->size; ++i) {
+            const llama_token_data & candidate = candidates->data[i];
+            if (candidate.id == selected) {
+                selected_index = (int) i;
+                selected_logit = candidate.logit;
+                selected_p = candidate.p;
+                break;
+            }
+        }
+    }
+
+    std::ostringstream out;
+    out << "{"
+        << "\"seed\":" << common_sampler_get_seed(smpl) << ","
+        << "\"configured_seed\":" << sampling.seed << ","
+        << "\"temp\":" << json_float_or_null(sampling.temp) << ","
+        << "\"top_k\":" << sampling.top_k << ","
+        << "\"top_p\":" << json_float_or_null(sampling.top_p) << ","
+        << "\"min_p\":" << json_float_or_null(sampling.min_p) << ","
+        << "\"typ_p\":" << json_float_or_null(sampling.typ_p) << ","
+        << "\"repeat_penalty\":" << json_float_or_null(sampling.penalty_repeat) << ","
+        << "\"repeat_last_n\":" << sampling.penalty_last_n << ","
+        << "\"candidate_count\":" << (candidates == nullptr ? 0 : (int) candidates->size) << ","
+        << "\"cur_selected_index\":" << (candidates == nullptr ? -1 : candidates->selected) << ","
+        << "\"selected_rank\":" << (selected_index >= 0 ? std::to_string(selected_index + 1) : "null") << ","
+        << "\"selected_logit\":" << json_float_or_null(selected_logit) << ","
+        << "\"selected_p\":" << json_float_or_null(selected_p) << ","
+        << "\"top_token\":" << token_json_or_null(top_token) << ","
+        << "\"top_logit\":" << json_float_or_null(top_logit) << ","
+        << "\"top_p\":" << json_float_or_null(top_p) << ","
+        << "\"selected_is_top\":" << (selected >= 0 && selected == top_token ? "true" : "false")
+        << "}";
+    return out.str();
+}
 #endif
 
 #ifdef NGPLUS_USE_UPSTREAM_GEMMA4
@@ -919,6 +970,7 @@ static void trace_step(
         const std::string & generated_token_pieces_prefix,
         const std::string & generated_token_pieces_tail,
         const std::string & top_candidates,
+        const std::string & sampler_diagnostics,
         llama_token sampler_selected_token,
         const std::string & sampler_selected_piece,
         bool reference_forced,
@@ -976,6 +1028,7 @@ static void trace_step(
           << "\"backend_sampling_requested\":" << (ngp.backend_sampling_requested ? "true" : "false") << ","
           << "\"server_backend_sampling\":" << (ngp.server_backend_sampling ? "true" : "false") << ","
           << "\"sampler_chain\":\"" << json_escape(ngp.sampler_chain) << "\","
+          << "\"sampler_diagnostics\":" << sampler_diagnostics << ","
           << "\"verification_mode\":\"ar_exact_prefill_diagnostic_draft\","
           << "\"draft_acceptance_enabled\":" << (ngp.draft_acceptance_enabled ? "true" : "false") << ","
           << "\"device_fallback\":" << (ngp.cpu_fallback ? "\"cpu_no_usable_offload_device\"" : "null") << ","
@@ -1324,10 +1377,13 @@ int main(int argc, char ** argv) {
             reference_forced = true;
         }
         const std::string top_candidates = top_candidates_json(ctx, smpl, 5, id);
+        const std::string sampler_diagnostics =
+            sampler_diagnostics_json(smpl, params.sampling, sampler_selected_token);
         const std::string reference_current_candidate =
             reference_candidate_json(ctx, smpl, reference_current_token, id);
 #else
         const std::string top_candidates = "[]";
+        const std::string sampler_diagnostics = "null";
         const std::string reference_current_candidate = "null";
 #endif
         common_sampler_accept(smpl, id, true);
@@ -1440,6 +1496,7 @@ int main(int argc, char ** argv) {
             token_pieces_prefix_json(ctx, generated_token_ids, 32),
             token_pieces_tail_json(ctx, generated_token_ids, 16),
             top_candidates,
+            sampler_diagnostics,
             sampler_selected_token,
             sampler_selected_piece,
             reference_forced,
