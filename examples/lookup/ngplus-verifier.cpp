@@ -787,6 +787,9 @@ static void trace_step(
         const std::string & previous_sampled_piece,
         const std::string & draft_source,
         const std::string & generated_prefix,
+        const std::string & generated_text_final,
+        int generated_text_bytes,
+        const std::string & generated_text_fnv1a64,
         const std::string & generated_token_ids,
         const std::string & generated_token_ids_prefix,
         const std::string & generated_token_ids_tail,
@@ -870,6 +873,9 @@ static void trace_step(
           << "\"previous_sampled_piece\":\"" << json_escape(previous_sampled_piece) << "\","
           << "\"generated_prefix\":\"" << json_escape(generated_prefix) << "\","
           << "\"generated_full_sequence_final\":" << (generated_full_sequence_final ? "true" : "false") << ","
+          << "\"generated_text_final\":\"" << json_escape(generated_text_final) << "\","
+          << "\"generated_text_bytes\":" << generated_text_bytes << ","
+          << "\"generated_text_fnv1a64\":\"" << json_escape(generated_text_fnv1a64) << "\","
           << "\"generated_token_ids\":" << generated_token_ids << ","
           << "\"generated_token_ids_prefix\":" << generated_token_ids_prefix << ","
           << "\"generated_token_ids_tail\":" << generated_token_ids_tail << ","
@@ -1169,6 +1175,7 @@ int main(int argc, char ** argv) {
 
         const bool generated_full_sequence_final =
             has_eos || !(params.n_predict < 0 || n_predict < params.n_predict);
+        const std::string generated_text_snapshot = generated_text.str();
         const int reference_first_mismatch = first_token_mismatch(generated_token_ids, ngp.reference_token_ids);
         const bool has_reference = !ngp.reference_token_ids.empty();
         const bool reference_prefix_matches = has_reference && reference_first_mismatch < 0;
@@ -1216,7 +1223,10 @@ int main(int argc, char ** argv) {
             llama_vocab_is_eog(vocab, id) ? std::string() : common_token_to_piece(ctx, id),
             previous_sampled_piece,
             draft_source,
-            string_prefix(generated_text.str(), 256),
+            string_prefix(generated_text_snapshot, 256),
+            generated_full_sequence_final ? generated_text_snapshot : std::string(),
+            (int) generated_text_snapshot.size(),
+            generated_full_sequence_final ? fnv1a64_hex(generated_text_snapshot) : std::string(),
             generated_full_sequence_final ? token_ids_json(generated_token_ids, 0, generated_token_ids.size()) : "[]",
             token_ids_prefix_json(generated_token_ids, 32),
             token_ids_tail_json(generated_token_ids, 16),
