@@ -7,8 +7,43 @@ target_compile_features(${TARGET_LOOKUP} PRIVATE cxx_std_17)
 set(TARGET_NGPLUS_VERIFIER llama-ngplus-verifier)
 add_executable(${TARGET_NGPLUS_VERIFIER} ngplus-verifier.cpp)
 install(TARGETS ${TARGET_NGPLUS_VERIFIER} RUNTIME)
-target_link_libraries(${TARGET_NGPLUS_VERIFIER} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET_NGPLUS_VERIFIER} PRIVATE cxx_std_17)
+
+set(NGPLUS_GEMMA4_LLAMA_ROOT "" CACHE PATH "Optional Gemma4-capable llama.cpp checkout for llama-ngplus-verifier")
+if(NOT NGPLUS_GEMMA4_LLAMA_ROOT AND EXISTS "/Users/baihuajun/Documents/llama.cpp-upstream/build/bin/libllama.dylib")
+    set(NGPLUS_GEMMA4_LLAMA_ROOT "/Users/baihuajun/Documents/llama.cpp-upstream")
+endif()
+
+if(NGPLUS_GEMMA4_LLAMA_ROOT)
+    set(NGPLUS_GEMMA4_BIN_DIR "${NGPLUS_GEMMA4_LLAMA_ROOT}/build/bin")
+    target_compile_definitions(${TARGET_NGPLUS_VERIFIER} PRIVATE NGPLUS_USE_UPSTREAM_GEMMA4)
+    target_include_directories(${TARGET_NGPLUS_VERIFIER} BEFORE PRIVATE
+        "${NGPLUS_GEMMA4_LLAMA_ROOT}/common"
+        "${NGPLUS_GEMMA4_LLAMA_ROOT}/include"
+        "${NGPLUS_GEMMA4_LLAMA_ROOT}/ggml/include"
+        "${NGPLUS_GEMMA4_LLAMA_ROOT}/src")
+    target_link_libraries(${TARGET_NGPLUS_VERIFIER} PRIVATE
+        "${NGPLUS_GEMMA4_BIN_DIR}/libllama-common.dylib"
+        "${NGPLUS_GEMMA4_BIN_DIR}/libllama.dylib"
+        "${NGPLUS_GEMMA4_BIN_DIR}/libggml.dylib"
+        "${NGPLUS_GEMMA4_BIN_DIR}/libggml-cpu.dylib"
+        "${NGPLUS_GEMMA4_BIN_DIR}/libggml-blas.dylib"
+        "${NGPLUS_GEMMA4_BIN_DIR}/libggml-metal.dylib"
+        "${NGPLUS_GEMMA4_BIN_DIR}/libggml-base.dylib"
+        ${CMAKE_THREAD_LIBS_INIT})
+    if(APPLE)
+        target_link_libraries(${TARGET_NGPLUS_VERIFIER} PRIVATE
+            "-framework Foundation"
+            "-framework Metal"
+            "-framework MetalKit"
+            "-framework Accelerate")
+    endif()
+    set_target_properties(${TARGET_NGPLUS_VERIFIER} PROPERTIES
+        BUILD_RPATH "${NGPLUS_GEMMA4_BIN_DIR}"
+        INSTALL_RPATH "${NGPLUS_GEMMA4_BIN_DIR}")
+else()
+    target_link_libraries(${TARGET_NGPLUS_VERIFIER} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
+endif()
 
 set(TARGET_LOOKUP_CREATE llama-lookup-create)
 add_executable(${TARGET_LOOKUP_CREATE} lookup-create.cpp)

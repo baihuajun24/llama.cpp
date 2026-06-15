@@ -20,9 +20,13 @@ struct ngplus_params {
     std::string cold_path;
     std::string cold_mmap = "on";
     std::string trace_path;
+    std::string out_file;
     int hot_ngram_max = 6;
     int draft = 8;
     int tree_budget = 64;
+    int effective_ngram_min = 2;
+    int effective_ngram_max = 4;
+    int effective_draft = 8;
     bool no_display_prompt = false;
 };
 
@@ -117,6 +121,8 @@ static std::vector<std::string> preprocess_args(int argc, char ** argv, ngplus_p
             ngp.tree_budget = parse_positive_int(value_for(name), name);
         } else if (name == "--ngplus-trace") {
             ngp.trace_path = value_for(name);
+        } else if (name == "-o" || name == "--output" || name == "--output-file") {
+            ngp.out_file = value_for(name);
         } else if (name == "--no-display-prompt") {
             ngp.no_display_prompt = true;
         } else if (name == "--single-turn") {
@@ -140,6 +146,9 @@ static std::vector<std::string> preprocess_args(int argc, char ** argv, ngplus_p
             if (!has_equals && i + 1 < argc) {
                 const std::string next = argv[i + 1];
                 if (next == "on" || next == "off" || next == "true" || next == "false") {
+#ifdef NGPLUS_USE_UPSTREAM_GEMMA4
+                    out.emplace_back(next);
+#endif
                     ++i;
                 }
             }
@@ -148,16 +157,9 @@ static std::vector<std::string> preprocess_args(int argc, char ** argv, ngplus_p
         }
     }
 
-    const int effective_draft = std::max(1, std::min(ngp.draft, ngp.tree_budget));
-    const int effective_ngram_max = std::max(1, std::min(4, ngp.hot_ngram_max));
-    const int effective_ngram_min = std::min(2, effective_ngram_max);
-
-    out.emplace_back("--draft-max");
-    out.emplace_back(std::to_string(effective_draft));
-    out.emplace_back("--ngram-min");
-    out.emplace_back(std::to_string(effective_ngram_min));
-    out.emplace_back("--ngram-max");
-    out.emplace_back(std::to_string(effective_ngram_max));
+    ngp.effective_draft = std::max(1, std::min(ngp.draft, ngp.tree_budget));
+    ngp.effective_ngram_max = std::max(1, std::min(4, ngp.hot_ngram_max));
+    ngp.effective_ngram_min = std::min(2, ngp.effective_ngram_max);
 
     return out;
 }
@@ -238,7 +240,6 @@ static void trace_step(
         std::ofstream & trace,
         int step,
         const ngplus_params & ngp,
-        const common_params & params,
         int drafted_tokens,
         int accepted_tokens,
         int target_tokens,
@@ -261,8 +262,8 @@ static void trace_step(
           << "\"cold_source\":\"noop\","
           << "\"cold_path\":\"" << json_escape(ngp.cold_path) << "\","
           << "\"cold_mmap\":\"" << json_escape(ngp.cold_mmap) << "\","
-          << "\"ngram_min\":" << params.ngram_min << ","
-          << "\"ngram_max\":" << params.ngram_max << ","
+          << "\"ngram_min\":" << ngp.effective_ngram_min << ","
+          << "\"ngram_max\":" << ngp.effective_ngram_max << ","
           << "\"source_order\":" << source_order << ","
           << "\"source_pos\":" << source_pos << ","
           << "\"ngplus_draft\":" << ngp.draft << ","
@@ -305,14 +306,28 @@ int main(int argc, char ** argv) {
     if (ngp.no_display_prompt) {
         params.display_prompt = false;
     }
+    if (!ngp.out_file.empty()) {
+        params.out_file = ngp.out_file;
+    }
 
     common_init();
     llama_backend_init();
     llama_numa_init(params.numa);
 
+#ifdef NGPLUS_USE_UPSTREAM_GEMMA4
+    common_init_result_ptr llama_init = common_init_from_params(params);
+    llama_model * model = llama_init->model();
+    llama_context * ctx = llama_init->context();
+#else
     common_init_result llama_init = common_init_from_params(params);
     llama_model * model = llama_init.model.get();
     llama_context * ctx = llama_init.context.get();
+#endif
+    if (model == nullptr || ctx == nullptr) {
+        LOG_ERR("failed to initialize Gemma4 target model/context for NG+ verification\n");
+        llama_backend_free();
+        return 1;
+    }
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     std::vector<llama_token> history = common_tokenize(ctx, params.prompt, true, true);
@@ -342,7 +357,7 @@ int main(int argc, char ** argv) {
     }
 
     const int n_input = (int) history.size();
-    const int n_draft = params.speculative.n_max;
+    const int n_draft = ngp.effective_draft;
     int n_predict = 0;
     int n_drafted = 0;
     int n_accept = 0;
@@ -384,7 +399,7 @@ int main(int argc, char ** argv) {
         const int draft_limit = std::max(0, std::min(n_draft, remaining - 1));
 
         const int64_t t_draft_start_us = ggml_time_us();
-        const prompt_draft_result draft_result = prompt_local_draft(history, params.ngram_max, draft_limit);
+        const prompt_draft_result draft_result = prompt_local_draft(history, ngp.effective_ngram_max, draft_limit);
         const int64_t draft_us = ggml_time_us() - t_draft_start_us;
 
         const llama_tokens & draft = draft_result.tokens;
@@ -428,14 +443,17 @@ int main(int argc, char ** argv) {
         }
 
         const int64_t t_kv_start_us = ggml_time_us();
+#ifdef NGPLUS_USE_UPSTREAM_GEMMA4
+        llama_memory_seq_rm(llama_get_memory(ctx), 0, n_past, -1);
+#else
         llama_kv_self_seq_rm(ctx, 0, n_past, -1);
+#endif
         const int64_t kv_cleanup_us = ggml_time_us() - t_kv_start_us;
 
         trace_step(
             trace,
             step++,
             ngp,
-            params,
             (int) draft.size(),
             accepted_from_draft,
             (int) ids.size(),
