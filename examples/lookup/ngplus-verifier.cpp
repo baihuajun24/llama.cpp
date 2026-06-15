@@ -12,10 +12,12 @@
 #include "sampling.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -37,9 +39,15 @@ struct ngplus_params {
     bool single_turn = true;
     bool chat_template_applied = false;
     bool prompt_sampler_seeded = false;
+    bool backend_sampling_requested = false;
     bool server_backend_sampling = false;
     bool draft_acceptance_enabled = false;
     bool no_display_prompt = false;
+    int prompt_tokens = 0;
+    int prompt_bytes = 0;
+    std::string prompt_fingerprint;
+    std::string chat_generation_prompt;
+    std::string sampler_chain;
 };
 
 struct prompt_draft_result {
@@ -313,6 +321,59 @@ static std::string json_escape(const std::string & input) {
     return out;
 }
 
+static std::string fnv1a64_hex(const std::string & input) {
+    uint64_t hash = 1469598103934665603ULL;
+    for (unsigned char ch : input) {
+        hash ^= ch;
+        hash *= 1099511628211ULL;
+    }
+
+    std::ostringstream out;
+    out << std::hex << std::setw(16) << std::setfill('0') << hash;
+    return out.str();
+}
+
+static std::string json_float_or_null(float value) {
+    if (!std::isfinite(value)) {
+        return "null";
+    }
+    std::ostringstream out;
+    out << value;
+    return out.str();
+}
+
+#ifdef NGPLUS_USE_UPSTREAM_GEMMA4
+static std::string top_candidates_json(
+        llama_context * ctx,
+        common_sampler * smpl,
+        int max_items,
+        llama_token selected) {
+    llama_token_data_array * candidates = common_sampler_get_candidates(smpl, true);
+    if (candidates == nullptr || candidates->size == 0 || max_items <= 0) {
+        return "[]";
+    }
+
+    std::ostringstream out;
+    out << "[";
+    const int n_items = std::min(max_items, (int) candidates->size);
+    for (int i = 0; i < n_items; ++i) {
+        const llama_token_data & candidate = candidates->data[i];
+        if (i > 0) {
+            out << ",";
+        }
+        out << "{"
+            << "\"id\":" << candidate.id << ","
+            << "\"logit\":" << json_float_or_null(candidate.logit) << ","
+            << "\"p\":" << json_float_or_null(candidate.p) << ","
+            << "\"selected\":" << (candidate.id == selected ? "true" : "false") << ","
+            << "\"piece\":\"" << json_escape(common_token_to_piece(ctx, candidate.id)) << "\""
+            << "}";
+    }
+    out << "]";
+    return out.str();
+}
+#endif
+
 #ifdef NGPLUS_USE_UPSTREAM_GEMMA4
 static bool apply_single_turn_chat_template(common_params & params, llama_model * model) {
     if (model == nullptr || params.prompt.empty()) {
@@ -339,6 +400,7 @@ static bool apply_single_turn_chat_template(common_params & params, llama_model 
 
     const common_chat_params chat_params = common_chat_templates_apply(chat_templates.get(), inputs);
     params.prompt = chat_params.prompt;
+    params.sampling.generation_prompt = chat_params.generation_prompt;
 
     return true;
 }
@@ -403,7 +465,10 @@ static void trace_step(
         int64_t tree_build_us,
         int64_t target_verify_us,
         int64_t kv_cleanup_us,
-        int output_tokens_total) {
+        int output_tokens_total,
+        llama_token sampled_token,
+        const std::string & sampled_piece,
+        const std::string & top_candidates) {
     if (!trace.is_open()) {
         return;
     }
@@ -417,8 +482,14 @@ static void trace_step(
           << "\"cold_path\":\"" << json_escape(ngp.cold_path) << "\","
           << "\"cold_mmap\":\"" << json_escape(ngp.cold_mmap) << "\","
           << "\"prompt_format\":\"" << (ngp.chat_template_applied ? "chat-single-turn" : "raw") << "\","
+          << "\"prompt_tokens\":" << ngp.prompt_tokens << ","
+          << "\"prompt_bytes\":" << ngp.prompt_bytes << ","
+          << "\"prompt_fingerprint\":\"" << ngp.prompt_fingerprint << "\","
+          << "\"chat_generation_prompt\":\"" << json_escape(ngp.chat_generation_prompt) << "\","
           << "\"prompt_sampler_seeded\":" << (ngp.prompt_sampler_seeded ? "true" : "false") << ","
+          << "\"backend_sampling_requested\":" << (ngp.backend_sampling_requested ? "true" : "false") << ","
           << "\"server_backend_sampling\":" << (ngp.server_backend_sampling ? "true" : "false") << ","
+          << "\"sampler_chain\":\"" << json_escape(ngp.sampler_chain) << "\","
           << "\"verification_mode\":\"ar_exact_prefill_diagnostic_draft\","
           << "\"draft_acceptance_enabled\":" << (ngp.draft_acceptance_enabled ? "true" : "false") << ","
           << "\"device_fallback\":" << (ngp.cpu_fallback ? "\"cpu_no_usable_offload_device\"" : "null") << ","
@@ -438,7 +509,10 @@ static void trace_step(
           << "\"tree_build_us\":" << tree_build_us << ","
           << "\"target_verify_us\":" << target_verify_us << ","
           << "\"kv_cleanup_us\":" << kv_cleanup_us << ","
-          << "\"output_tokens_total\":" << output_tokens_total
+          << "\"output_tokens_total\":" << output_tokens_total << ","
+          << "\"sampled_token\":" << sampled_token << ","
+          << "\"sampled_piece\":\"" << json_escape(sampled_piece) << "\","
+          << "\"top_candidates\":" << top_candidates
           << "}\n";
 }
 
@@ -501,6 +575,8 @@ int main(int argc, char ** argv) {
 #ifdef NGPLUS_USE_UPSTREAM_GEMMA4
     if (ngp.single_turn) {
         try {
+            params.enable_reasoning = 0;
+            params.default_template_kwargs["enable_thinking"] = "false";
             ngp.chat_template_applied = apply_single_turn_chat_template(params, model);
         } catch (const std::exception & e) {
             LOG_ERR("failed to apply single-turn chat template for NG+ verification: %s\n", e.what());
@@ -519,6 +595,10 @@ int main(int argc, char ** argv) {
         llama_backend_free();
         return 1;
     }
+    ngp.prompt_tokens = (int) history.size();
+    ngp.prompt_bytes = (int) params.prompt.size();
+    ngp.prompt_fingerprint = fnv1a64_hex(params.prompt);
+    ngp.chat_generation_prompt = params.sampling.generation_prompt;
 
     const int64_t t_hot_init_start_us = ggml_time_us();
     const int64_t t_hot_init_us = ggml_time_us() - t_hot_init_start_us;
@@ -559,14 +639,18 @@ int main(int argc, char ** argv) {
     std::stringstream generated_text;
     struct common_sampler * smpl = common_sampler_init(model, params.sampling);
     common_sampler_reset(smpl);
+    ngp.backend_sampling_requested = params.sampling.backend_sampling;
+    ngp.sampler_chain = common_sampler_print(smpl);
 
 #ifdef NGPLUS_USE_UPSTREAM_GEMMA4
-    // llama-server attaches the sampler before prompt decode, then resets and
-    // seeds it after prompt decode. Mirroring that preserves the first-token
-    // backend-sampling surface used by the fixed server baseline.
-    ngp.server_backend_sampling = llama_set_sampler(ctx, 0, common_sampler_get(smpl));
-    if (!ngp.server_backend_sampling) {
-        LOG_WRN("ngplus: failed to attach server-aligned backend sampler; falling back to host sampling\n");
+    // The fixed server baseline only attaches a backend sampler when -bs /
+    // --backend-sampling is requested. Respect that flag so the verifier does
+    // not silently test a different sampling surface from the server command.
+    if (params.sampling.backend_sampling) {
+        ngp.server_backend_sampling = llama_set_sampler(ctx, 0, common_sampler_get(smpl));
+        if (!ngp.server_backend_sampling) {
+            LOG_WRN("ngplus: failed to attach requested backend sampler; falling back to host sampling\n");
+        }
     }
 #endif
 
@@ -612,6 +696,11 @@ int main(int argc, char ** argv) {
 
         const int64_t t_verify_start_us = ggml_time_us();
         const llama_token id = common_sampler_sample(smpl, ctx, -1);
+#ifdef NGPLUS_USE_UPSTREAM_GEMMA4
+        const std::string top_candidates = top_candidates_json(ctx, smpl, 5, id);
+#else
+        const std::string top_candidates = "[]";
+#endif
         common_sampler_accept(smpl, id, true);
 
         const int accepted_from_draft = 0;
@@ -663,7 +752,10 @@ int main(int argc, char ** argv) {
             draft_us,
             verify_us,
             kv_cleanup_us,
-            n_predict);
+            n_predict,
+            id,
+            llama_vocab_is_eog(vocab, id) ? std::string() : common_token_to_piece(ctx, id),
+            top_candidates);
     }
 
     const auto t_dec_end = ggml_time_us();
