@@ -368,6 +368,15 @@ static std::string token_ids_json(
     return out.str();
 }
 
+static std::string token_ids_prefix_json(const std::vector<llama_token> & tokens, size_t max_items) {
+    return token_ids_json(tokens, 0, std::min(max_items, tokens.size()));
+}
+
+static std::string token_ids_tail_json(const std::vector<llama_token> & tokens, size_t max_items) {
+    const size_t begin = tokens.size() > max_items ? tokens.size() - max_items : 0;
+    return token_ids_json(tokens, begin, tokens.size());
+}
+
 static std::string string_suffix(const std::string & input, size_t max_bytes) {
     if (input.size() <= max_bytes) {
         return input;
@@ -535,6 +544,8 @@ static void trace_step(
         const std::string & sampled_piece,
         const std::string & previous_sampled_piece,
         const std::string & generated_prefix,
+        const std::string & generated_token_ids_prefix,
+        const std::string & generated_token_ids_tail,
         const std::string & top_candidates) {
     if (!trace.is_open()) {
         return;
@@ -589,6 +600,8 @@ static void trace_step(
           << "\"sampled_piece\":\"" << json_escape(sampled_piece) << "\","
           << "\"previous_sampled_piece\":\"" << json_escape(previous_sampled_piece) << "\","
           << "\"generated_prefix\":\"" << json_escape(generated_prefix) << "\","
+          << "\"generated_token_ids_prefix\":" << generated_token_ids_prefix << ","
+          << "\"generated_token_ids_tail\":" << generated_token_ids_tail << ","
           << "\"top_candidates\":" << top_candidates
           << "}\n";
 }
@@ -765,6 +778,7 @@ int main(int argc, char ** argv) {
     int step = 0;
     llama_token previous_sampled_token = -1;
     std::string previous_sampled_piece;
+    std::vector<llama_token> generated_token_ids;
 
     while (!has_eos && (params.n_predict < 0 || n_predict < params.n_predict)) {
         const int remaining = params.n_predict < 0 ? n_draft : std::max(1, params.n_predict - n_predict);
@@ -797,6 +811,7 @@ int main(int argc, char ** argv) {
             const std::string token_str = common_token_to_piece(ctx, id);
             LOG("%s", token_str.c_str());
             generated_text << token_str;
+            generated_token_ids.push_back(id);
             ++n_predict;
         }
 
@@ -840,6 +855,8 @@ int main(int argc, char ** argv) {
             llama_vocab_is_eog(vocab, id) ? std::string() : common_token_to_piece(ctx, id),
             previous_sampled_piece,
             string_prefix(generated_text.str(), 256),
+            token_ids_prefix_json(generated_token_ids, 32),
+            token_ids_tail_json(generated_token_ids, 16),
             top_candidates);
         previous_sampled_token = id;
         previous_sampled_piece = llama_vocab_is_eog(vocab, id) ? std::string() : common_token_to_piece(ctx, id);
