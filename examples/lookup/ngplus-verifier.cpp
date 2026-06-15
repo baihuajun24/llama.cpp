@@ -73,6 +73,10 @@ struct prompt_draft_result {
     llama_tokens tokens;
     int order = 0;
     int source_pos = -1;
+    int continuation_start = -1;
+    int continuation_available = 0;
+    int continuation_copied = 0;
+    bool truncated_by_draft_limit = false;
 };
 
 static std::string draft_source_label(const prompt_draft_result & draft_result, int prompt_tokens) {
@@ -748,6 +752,10 @@ static prompt_draft_result prompt_local_draft(
                 history.begin() + continuation_start + n_copy);
             result.order = order;
             result.source_pos = pos;
+            result.continuation_start = continuation_start;
+            result.continuation_available = available;
+            result.continuation_copied = n_copy;
+            result.truncated_by_draft_limit = n_copy < available;
             return result;
         }
     }
@@ -764,6 +772,10 @@ static void trace_step(
         int target_tokens,
         int source_order,
         int source_pos,
+        int source_continuation_start,
+        int source_continuation_available,
+        int source_continuation_copied,
+        bool source_truncated_by_draft_limit,
         int64_t hot_lookup_us,
         int64_t tree_build_us,
         int64_t target_verify_us,
@@ -828,6 +840,12 @@ static void trace_step(
           << "\"ngram_max\":" << ngp.effective_ngram_max << ","
           << "\"source_order\":" << source_order << ","
           << "\"source_pos\":" << source_pos << ","
+          << "\"source_continuation_start\":" << source_continuation_start << ","
+          << "\"source_continuation_available\":" << source_continuation_available << ","
+          << "\"source_continuation_copied\":" << source_continuation_copied << ","
+          << "\"source_truncated_by_draft_limit\":" << (source_truncated_by_draft_limit ? "true" : "false") << ","
+          << "\"source_truncation_reason\":"
+          << (source_truncated_by_draft_limit ? "\"ngplus_draft_limit\"" : "null") << ","
           << "\"ngplus_draft\":" << ngp.draft << ","
           << "\"tree_budget\":" << ngp.tree_budget << ","
           << "\"drafted_tokens\":" << drafted_tokens << ","
@@ -1173,6 +1191,10 @@ int main(int argc, char ** argv) {
             1,
             draft_result.order,
             draft_result.source_pos,
+            draft_result.continuation_start,
+            draft_result.continuation_available,
+            draft_result.continuation_copied,
+            draft_result.truncated_by_draft_limit,
             draft_us,
             draft_us,
             verify_us,
