@@ -12,6 +12,7 @@
 #include "sampling.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -29,6 +30,8 @@ struct ngplus_params {
     std::string cold_mmap = "on";
     std::string trace_path;
     std::string out_file;
+    std::string reference_token_ids_arg;
+    std::vector<llama_token> reference_token_ids;
     int hot_ngram_max = 6;
     int draft = 8;
     int tree_budget = 64;
@@ -74,6 +77,8 @@ static void print_ngplus_usage(int, char **) {
     printf("  --ngplus-draft N              maximum prompt-local draft continuation length (default: 8)\n");
     printf("  --ngplus-tree-budget N        maximum verifier tree budget for this narrow verifier (default: 64)\n");
     printf("  --ngplus-trace FNAME          write per-step NG+ JSONL trace rows\n");
+    printf("  --ngplus-reference-token-ids IDS|@FILE\n");
+    printf("                                optional comma/space-separated reference token IDs for trace exactness diagnostics\n");
 }
 
 static std::string require_value(int argc, char ** argv, int & i, const std::string & arg) {
@@ -228,6 +233,8 @@ static std::vector<std::string> preprocess_args(int argc, char ** argv, ngplus_p
             ngp.tree_budget = parse_positive_int(value_for(name), name);
         } else if (name == "--ngplus-trace") {
             ngp.trace_path = value_for(name);
+        } else if (name == "--ngplus-reference-token-ids") {
+            ngp.reference_token_ids_arg = value_for(name);
         } else if (name == "-o" || name == "--output" || name == "--output-file") {
             ngp.out_file = value_for(name);
         } else if (name == "--no-display-prompt") {
@@ -349,6 +356,66 @@ static std::string json_float_or_null(float value) {
     std::ostringstream out;
     out << value;
     return out.str();
+}
+
+static std::vector<llama_token> parse_reference_token_ids(const std::string & spec) {
+    std::string payload = spec;
+    if (!payload.empty() && payload[0] == '@') {
+        const std::string path = payload.substr(1);
+        std::ifstream file(path);
+        if (!file.is_open()) {
+            throw std::invalid_argument("failed to open --ngplus-reference-token-ids file: " + path);
+        }
+        std::ostringstream buffer;
+        buffer << file.rdbuf();
+        payload = buffer.str();
+    }
+
+    std::vector<llama_token> out;
+    std::string current;
+    auto flush = [&]() {
+        if (current.empty()) {
+            return;
+        }
+        try {
+            out.push_back((llama_token) std::stoll(current));
+        } catch (const std::exception &) {
+            throw std::invalid_argument("invalid token id in --ngplus-reference-token-ids: " + current);
+        }
+        current.clear();
+    };
+
+    for (char ch : payload) {
+        if (std::isdigit((unsigned char) ch) || (ch == '-' && current.empty())) {
+            current.push_back(ch);
+        } else {
+            flush();
+        }
+    }
+    flush();
+    return out;
+}
+
+static int first_token_mismatch(
+        const std::vector<llama_token> & generated,
+        const std::vector<llama_token> & reference) {
+    const size_t common = std::min(generated.size(), reference.size());
+    for (size_t i = 0; i < common; ++i) {
+        if (generated[i] != reference[i]) {
+            return (int) i;
+        }
+    }
+    if (generated.size() > reference.size()) {
+        return (int) reference.size();
+    }
+    return -1;
+}
+
+static std::string token_json_or_null(llama_token token) {
+    if (token < 0) {
+        return "null";
+    }
+    return std::to_string(token);
 }
 
 static std::string token_ids_json(
@@ -588,6 +655,12 @@ static void trace_step(
         const std::string & generated_token_pieces_prefix,
         const std::string & generated_token_pieces_tail,
         const std::string & top_candidates,
+        int reference_token_count,
+        int reference_first_mismatch_index,
+        llama_token reference_expected_token,
+        const std::string & reference_expected_piece,
+        bool reference_prefix_matches,
+        bool reference_final_matches,
         bool generated_full_sequence_final) {
     if (!trace.is_open()) {
         return;
@@ -651,6 +724,15 @@ static void trace_step(
           << "\"generated_token_pieces\":" << generated_token_pieces << ","
           << "\"generated_token_pieces_prefix\":" << generated_token_pieces_prefix << ","
           << "\"generated_token_pieces_tail\":" << generated_token_pieces_tail << ","
+          << "\"reference_token_count\":" << reference_token_count << ","
+          << "\"reference_prefix_matches\":" << (reference_prefix_matches ? "true" : "false") << ","
+          << "\"reference_final_matches\":"
+          << (generated_full_sequence_final && reference_token_count > 0 ? (reference_final_matches ? "true" : "false") : "null") << ","
+          << "\"reference_first_mismatch_index\":"
+          << (reference_first_mismatch_index >= 0 ? std::to_string(reference_first_mismatch_index) : "null") << ","
+          << "\"reference_expected_token\":" << token_json_or_null(reference_expected_token) << ","
+          << "\"reference_expected_piece\":"
+          << (reference_expected_piece.empty() ? "null" : ("\"" + json_escape(reference_expected_piece) + "\"")) << ","
           << "\"top_candidates\":" << top_candidates
           << "}\n";
 }
@@ -681,6 +763,14 @@ int main(int argc, char ** argv) {
     }
     if (!ngp.out_file.empty()) {
         params.out_file = ngp.out_file;
+    }
+    try {
+        if (!ngp.reference_token_ids_arg.empty()) {
+            ngp.reference_token_ids = parse_reference_token_ids(ngp.reference_token_ids_arg);
+        }
+    } catch (const std::exception & e) {
+        LOG_ERR("%s\n", e.what());
+        return 1;
     }
 #ifdef NGPLUS_USE_UPSTREAM_GEMMA4
     if (ngp.cpu_fallback) {
@@ -889,6 +979,23 @@ int main(int argc, char ** argv) {
 
         const bool generated_full_sequence_final =
             has_eos || !(params.n_predict < 0 || n_predict < params.n_predict);
+        const int reference_first_mismatch = first_token_mismatch(generated_token_ids, ngp.reference_token_ids);
+        const bool has_reference = !ngp.reference_token_ids.empty();
+        const bool reference_prefix_matches = has_reference && reference_first_mismatch < 0;
+        const bool reference_final_matches =
+            has_reference && generated_full_sequence_final &&
+            reference_prefix_matches &&
+            generated_token_ids.size() == ngp.reference_token_ids.size();
+        llama_token reference_expected_token = -1;
+        if (has_reference) {
+            const size_t expected_index =
+                reference_first_mismatch >= 0 ? (size_t) reference_first_mismatch : generated_token_ids.size();
+            if (expected_index < ngp.reference_token_ids.size()) {
+                reference_expected_token = ngp.reference_token_ids[expected_index];
+            }
+        }
+        const std::string reference_expected_piece =
+            reference_expected_token >= 0 ? common_token_to_piece(ctx, reference_expected_token) : std::string();
 
         trace_step(
             trace,
@@ -916,6 +1023,12 @@ int main(int argc, char ** argv) {
             token_pieces_prefix_json(ctx, generated_token_ids, 32),
             token_pieces_tail_json(ctx, generated_token_ids, 16),
             top_candidates,
+            (int) ngp.reference_token_ids.size(),
+            reference_first_mismatch,
+            reference_expected_token,
+            reference_expected_piece,
+            reference_prefix_matches,
+            reference_final_matches,
             generated_full_sequence_final);
         previous_sampled_token = id;
         previous_sampled_piece = llama_vocab_is_eog(vocab, id) ? std::string() : common_token_to_piece(ctx, id);
