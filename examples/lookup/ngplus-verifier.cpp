@@ -1,5 +1,8 @@
 #include "arg.h"
 #include "common.h"
+#ifdef NGPLUS_USE_UPSTREAM_GEMMA4
+#include "ggml-backend.h"
+#endif
 #include "ggml.h"
 #include "llama.h"
 #include "log.h"
@@ -27,6 +30,7 @@ struct ngplus_params {
     int effective_ngram_min = 2;
     int effective_ngram_max = 4;
     int effective_draft = 8;
+    bool cpu_fallback = false;
     bool no_display_prompt = false;
 };
 
@@ -77,6 +81,75 @@ static int parse_positive_int(const std::string & value, const std::string & arg
     return parsed;
 }
 
+#ifdef NGPLUS_USE_UPSTREAM_GEMMA4
+static bool is_inspection_arg(const std::string & name) {
+    return name == "-h" || name == "--help" || name == "--usage" || name == "--list-devices";
+}
+
+static bool is_gpu_layers_arg(const std::string & name) {
+    return name == "-ngl" || name == "--gpu-layers" || name == "--n-gpu-layers";
+}
+
+static bool is_device_arg(const std::string & name) {
+    return name == "-dev" || name == "--device";
+}
+
+static bool is_flash_attn_arg(const std::string & name) {
+    return name == "-fa" || name == "--flash-attn";
+}
+
+static bool gpu_layers_request_uses_offload(const std::string & value) {
+    return value != "0" && value != "none" && value != "off";
+}
+
+static bool has_usable_offload_device() {
+    ggml_backend_load_all();
+
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU &&
+                type != GGML_BACKEND_DEVICE_TYPE_IGPU &&
+                type != GGML_BACKEND_DEVICE_TYPE_META) {
+            continue;
+        }
+
+        size_t free = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        if (total > 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool should_force_cpu_fallback(int argc, char ** argv) {
+    bool inspection_only = false;
+    bool requested_gpu_offload = false;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        std::string key;
+        std::string value;
+        const bool has_equals = split_equals_arg(arg, key, value);
+        const std::string name = has_equals ? key : arg;
+
+        if (is_inspection_arg(name)) {
+            inspection_only = true;
+        }
+
+        if (is_gpu_layers_arg(name)) {
+            const std::string gpu_layers = has_equals ? value : (i + 1 < argc ? argv[i + 1] : "");
+            requested_gpu_offload = gpu_layers_request_uses_offload(gpu_layers);
+        }
+    }
+
+    return requested_gpu_offload && !inspection_only && !has_usable_offload_device();
+}
+#endif
+
 static std::string resolve_hf_repo_to_local_model(const std::string & repo) {
     static const std::string gemma4_repo = "unsloth/gemma-4-12b-it-GGUF:Q4_K_M";
     static const std::string gemma4_model =
@@ -95,6 +168,15 @@ static std::string resolve_hf_repo_to_local_model(const std::string & repo) {
 static std::vector<std::string> preprocess_args(int argc, char ** argv, ngplus_params & ngp) {
     std::vector<std::string> out;
     out.emplace_back(argv[0]);
+
+#ifdef NGPLUS_USE_UPSTREAM_GEMMA4
+    const bool force_cpu = should_force_cpu_fallback(argc, argv);
+    bool wrote_cpu_device = false;
+    bool wrote_flash_attn = false;
+    ngp.cpu_fallback = force_cpu;
+#else
+    const bool force_cpu = false;
+#endif
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -141,21 +223,54 @@ static std::vector<std::string> preprocess_args(int argc, char ** argv, ngplus_p
                     out.emplace_back(repo);
                 }
             }
-        } else if (name == "-fa" || name == "--flash-attn") {
-            out.emplace_back(arg);
+        } else if (is_flash_attn_arg(name)) {
+            out.emplace_back(force_cpu ? "-fa" : arg);
             if (!has_equals && i + 1 < argc) {
                 const std::string next = argv[i + 1];
-                if (next == "on" || next == "off" || next == "true" || next == "false") {
+                if (next == "on" || next == "off" || next == "auto" || next == "true" || next == "false") {
 #ifdef NGPLUS_USE_UPSTREAM_GEMMA4
-                    out.emplace_back(next);
+                    out.emplace_back(force_cpu ? "off" : next);
+                    wrote_flash_attn = true;
 #endif
                     ++i;
                 }
             }
+#ifdef NGPLUS_USE_UPSTREAM_GEMMA4
+            if (force_cpu && has_equals) {
+                out.emplace_back("off");
+                wrote_flash_attn = true;
+            }
+#endif
+#ifdef NGPLUS_USE_UPSTREAM_GEMMA4
+        } else if (is_gpu_layers_arg(name) && force_cpu) {
+            if (!has_equals) {
+                require_value(argc, argv, i, name);
+            }
+            out.emplace_back("-ngl");
+            out.emplace_back("0");
+        } else if (is_device_arg(name) && force_cpu) {
+            if (!has_equals) {
+                require_value(argc, argv, i, name);
+            }
+            out.emplace_back("-dev");
+            out.emplace_back("none");
+            wrote_cpu_device = true;
+#endif
         } else {
             out.emplace_back(arg);
         }
     }
+
+#ifdef NGPLUS_USE_UPSTREAM_GEMMA4
+    if (force_cpu && !wrote_cpu_device) {
+        out.emplace_back("-dev");
+        out.emplace_back("none");
+    }
+    if (force_cpu && !wrote_flash_attn) {
+        out.emplace_back("-fa");
+        out.emplace_back("off");
+    }
+#endif
 
     ngp.effective_draft = std::max(1, std::min(ngp.draft, ngp.tree_budget));
     ngp.effective_ngram_max = std::max(1, std::min(4, ngp.hot_ngram_max));
@@ -262,6 +377,7 @@ static void trace_step(
           << "\"cold_source\":\"noop\","
           << "\"cold_path\":\"" << json_escape(ngp.cold_path) << "\","
           << "\"cold_mmap\":\"" << json_escape(ngp.cold_mmap) << "\","
+          << "\"device_fallback\":" << (ngp.cpu_fallback ? "\"cpu_no_usable_offload_device\"" : "null") << ","
           << "\"ngram_min\":" << ngp.effective_ngram_min << ","
           << "\"ngram_max\":" << ngp.effective_ngram_max << ","
           << "\"source_order\":" << source_order << ","
@@ -309,6 +425,14 @@ int main(int argc, char ** argv) {
     if (!ngp.out_file.empty()) {
         params.out_file = ngp.out_file;
     }
+#ifdef NGPLUS_USE_UPSTREAM_GEMMA4
+    if (ngp.cpu_fallback) {
+        params.devices.assign(1, nullptr);
+        params.n_gpu_layers = 0;
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        LOG_WRN("ngplus: no usable GPU/Metal offload device visible; using CPU fallback (-ngl 0, -dev none, -fa off)\n");
+    }
+#endif
 
     common_init();
     llama_backend_init();
