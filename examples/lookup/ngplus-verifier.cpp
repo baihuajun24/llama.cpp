@@ -31,7 +31,10 @@ struct ngplus_params {
     std::string trace_path;
     std::string out_file;
     std::string reference_token_ids_arg;
+    std::string reference_text_arg;
     std::vector<llama_token> reference_token_ids;
+    int reference_text_bytes = 0;
+    std::string reference_source = "none";
     int hot_ngram_max = 6;
     int draft = 8;
     int tree_budget = 64;
@@ -79,6 +82,8 @@ static void print_ngplus_usage(int, char **) {
     printf("  --ngplus-trace FNAME          write per-step NG+ JSONL trace rows\n");
     printf("  --ngplus-reference-token-ids IDS|@FILE\n");
     printf("                                optional comma/space-separated reference token IDs for trace exactness diagnostics\n");
+    printf("  --ngplus-reference-text TEXT|@FILE\n");
+    printf("                                optional generated reference text to tokenize for trace exactness diagnostics\n");
 }
 
 static std::string require_value(int argc, char ** argv, int & i, const std::string & arg) {
@@ -235,6 +240,8 @@ static std::vector<std::string> preprocess_args(int argc, char ** argv, ngplus_p
             ngp.trace_path = value_for(name);
         } else if (name == "--ngplus-reference-token-ids") {
             ngp.reference_token_ids_arg = value_for(name);
+        } else if (name == "--ngplus-reference-text") {
+            ngp.reference_text_arg = value_for(name);
         } else if (name == "-o" || name == "--output" || name == "--output-file") {
             ngp.out_file = value_for(name);
         } else if (name == "--no-display-prompt") {
@@ -394,6 +401,22 @@ static std::vector<llama_token> parse_reference_token_ids(const std::string & sp
     }
     flush();
     return out;
+}
+
+static std::string parse_reference_text(const std::string & spec) {
+    if (spec.empty() || spec[0] != '@') {
+        return spec;
+    }
+
+    const std::string path = spec.substr(1);
+    std::ifstream file(path, std::ios::binary);
+    if (!file.is_open()) {
+        throw std::invalid_argument("failed to open --ngplus-reference-text file: " + path);
+    }
+
+    std::ostringstream buffer;
+    buffer << file.rdbuf();
+    return buffer.str();
 }
 
 static int first_token_mismatch(
@@ -655,7 +678,9 @@ static void trace_step(
         const std::string & generated_token_pieces_prefix,
         const std::string & generated_token_pieces_tail,
         const std::string & top_candidates,
+        const std::string & reference_source,
         int reference_token_count,
+        int reference_text_bytes,
         int reference_first_mismatch_index,
         llama_token reference_expected_token,
         const std::string & reference_expected_piece,
@@ -724,7 +749,9 @@ static void trace_step(
           << "\"generated_token_pieces\":" << generated_token_pieces << ","
           << "\"generated_token_pieces_prefix\":" << generated_token_pieces_prefix << ","
           << "\"generated_token_pieces_tail\":" << generated_token_pieces_tail << ","
+          << "\"reference_source\":\"" << json_escape(reference_source) << "\","
           << "\"reference_token_count\":" << reference_token_count << ","
+          << "\"reference_text_bytes\":" << reference_text_bytes << ","
           << "\"reference_prefix_matches\":" << (reference_prefix_matches ? "true" : "false") << ","
           << "\"reference_final_matches\":"
           << (generated_full_sequence_final && reference_token_count > 0 ? (reference_final_matches ? "true" : "false") : "null") << ","
@@ -765,8 +792,12 @@ int main(int argc, char ** argv) {
         params.out_file = ngp.out_file;
     }
     try {
+        if (!ngp.reference_token_ids_arg.empty() && !ngp.reference_text_arg.empty()) {
+            throw std::invalid_argument("--ngplus-reference-token-ids and --ngplus-reference-text are mutually exclusive");
+        }
         if (!ngp.reference_token_ids_arg.empty()) {
             ngp.reference_token_ids = parse_reference_token_ids(ngp.reference_token_ids_arg);
+            ngp.reference_source = "token-ids";
         }
     } catch (const std::exception & e) {
         LOG_ERR("%s\n", e.what());
@@ -800,6 +831,19 @@ int main(int argc, char ** argv) {
         return 1;
     }
     const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    try {
+        if (!ngp.reference_text_arg.empty()) {
+            const std::string reference_text = parse_reference_text(ngp.reference_text_arg);
+            ngp.reference_text_bytes = (int) reference_text.size();
+            ngp.reference_token_ids = common_tokenize(vocab, reference_text, false, true);
+            ngp.reference_source = "text";
+        }
+    } catch (const std::exception & e) {
+        LOG_ERR("%s\n", e.what());
+        llama_backend_free();
+        return 1;
+    }
 
 #ifdef NGPLUS_USE_UPSTREAM_GEMMA4
     if (ngp.single_turn) {
@@ -1023,7 +1067,9 @@ int main(int argc, char ** argv) {
             token_pieces_prefix_json(ctx, generated_token_ids, 32),
             token_pieces_tail_json(ctx, generated_token_ids, 16),
             top_candidates,
+            ngp.reference_source,
             (int) ngp.reference_token_ids.size(),
+            ngp.reference_text_bytes,
             reference_first_mismatch,
             reference_expected_token,
             reference_expected_piece,
