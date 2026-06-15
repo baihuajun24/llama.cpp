@@ -35,6 +35,7 @@ struct ngplus_params {
     std::string reference_json_arg;
     std::vector<llama_token> reference_token_ids;
     int reference_text_bytes = 0;
+    std::string reference_text_fnv1a64;
     std::string reference_source = "none";
     int hot_ngram_max = 6;
     int draft = 8;
@@ -817,6 +818,7 @@ static void trace_step(
         const std::string & reference_source,
         int reference_token_count,
         int reference_text_bytes,
+        const std::string & reference_text_fnv1a64,
         int reference_first_mismatch_index,
         llama_token reference_expected_token,
         llama_token reference_actual_token,
@@ -904,6 +906,8 @@ static void trace_step(
           << "\"reference_source\":\"" << json_escape(reference_source) << "\","
           << "\"reference_token_count\":" << reference_token_count << ","
           << "\"reference_text_bytes\":" << reference_text_bytes << ","
+          << "\"reference_text_fnv1a64\":"
+          << (reference_text_fnv1a64.empty() ? "null" : ("\"" + json_escape(reference_text_fnv1a64) + "\"")) << ","
           << "\"reference_prefix_matches\":" << (reference_prefix_matches ? "true" : "false") << ","
           << "\"reference_final_matches\":"
           << (generated_full_sequence_final && reference_token_count > 0 ? (reference_final_matches ? "true" : "false") : "null") << ","
@@ -999,6 +1003,7 @@ int main(int argc, char ** argv) {
                 parse_reference_json_content(ngp.reference_json_arg) :
                 parse_reference_text(ngp.reference_text_arg);
             ngp.reference_text_bytes = (int) reference_text.size();
+            ngp.reference_text_fnv1a64 = fnv1a64_hex(reference_text);
             ngp.reference_token_ids = common_tokenize(vocab, reference_text, false, true);
             ngp.reference_source = from_json ? "json-content" : "text";
         }
@@ -1266,6 +1271,7 @@ int main(int argc, char ** argv) {
             ngp.reference_source,
             (int) ngp.reference_token_ids.size(),
             ngp.reference_text_bytes,
+            ngp.reference_text_fnv1a64,
             reference_first_mismatch,
             reference_expected_token,
             reference_actual_token,
