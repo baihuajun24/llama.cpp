@@ -34,6 +34,7 @@ struct ngplus_params {
     std::string reference_text_arg;
     std::string reference_json_arg;
     std::string reference_prompt_text_arg;
+    std::string reference_prompt_json_arg;
     std::vector<llama_token> reference_token_ids;
     int reference_text_bytes = 0;
     std::string reference_text_fnv1a64;
@@ -114,6 +115,8 @@ static void print_ngplus_usage(int, char **) {
     printf("                                optional OpenAI-compatible response JSON; extracts choices[0].message.content\n");
     printf("  --ngplus-reference-prompt-text TEXT|@FILE\n");
     printf("                                optional formatted prompt text for trace prompt-template diagnostics\n");
+    printf("  --ngplus-reference-prompt-json JSON|@FILE\n");
+    printf("                                optional server /apply-template JSON; extracts prompt for trace diagnostics\n");
 }
 
 static std::string require_value(int argc, char ** argv, int & i, const std::string & arg) {
@@ -276,6 +279,8 @@ static std::vector<std::string> preprocess_args(int argc, char ** argv, ngplus_p
             ngp.reference_json_arg = value_for(name);
         } else if (name == "--ngplus-reference-prompt-text") {
             ngp.reference_prompt_text_arg = value_for(name);
+        } else if (name == "--ngplus-reference-prompt-json") {
+            ngp.reference_prompt_json_arg = value_for(name);
         } else if (name == "-o" || name == "--output" || name == "--output-file") {
             ngp.out_file = value_for(name);
         } else if (name == "--no-display-prompt") {
@@ -477,16 +482,6 @@ static std::string parse_reference_prompt_text(const std::string & spec) {
     return read_inline_or_at_file(spec, "--ngplus-reference-prompt-text");
 }
 
-static int first_byte_mismatch(const std::string & actual, const std::string & expected) {
-    const size_t common = std::min(actual.size(), expected.size());
-    for (size_t i = 0; i < common; ++i) {
-        if (actual[i] != expected[i]) {
-            return (int) i;
-        }
-    }
-    return actual.size() == expected.size() ? -1 : (int) common;
-}
-
 static std::string parse_json_string_at(const std::string & payload, size_t quote_pos) {
     if (quote_pos >= payload.size() || payload[quote_pos] != '"') {
         throw std::invalid_argument("internal JSON parser expected string quote");
@@ -566,6 +561,25 @@ static std::string parse_reference_json_content(const std::string & spec) {
             "--ngplus-reference-json could not find a non-empty content/generated_text/text string");
     }
     return content;
+}
+
+static std::string parse_reference_prompt_json_content(const std::string & spec) {
+    const std::string payload = read_inline_or_at_file(spec, "--ngplus-reference-prompt-json");
+    std::string prompt = extract_first_json_string_value(payload, "prompt");
+    if (prompt.empty()) {
+        throw std::invalid_argument("--ngplus-reference-prompt-json could not find a non-empty prompt string");
+    }
+    return prompt;
+}
+
+static int first_byte_mismatch(const std::string & actual, const std::string & expected) {
+    const size_t common = std::min(actual.size(), expected.size());
+    for (size_t i = 0; i < common; ++i) {
+        if (actual[i] != expected[i]) {
+            return (int) i;
+        }
+    }
+    return actual.size() == expected.size() ? -1 : (int) common;
 }
 
 static int first_token_mismatch(
@@ -994,6 +1008,10 @@ int main(int argc, char ** argv) {
             throw std::invalid_argument(
                 "--ngplus-reference-token-ids, --ngplus-reference-text, and --ngplus-reference-json are mutually exclusive");
         }
+        if (!ngp.reference_prompt_text_arg.empty() && !ngp.reference_prompt_json_arg.empty()) {
+            throw std::invalid_argument(
+                "--ngplus-reference-prompt-text and --ngplus-reference-prompt-json are mutually exclusive");
+        }
         if (!ngp.reference_token_ids_arg.empty()) {
             ngp.reference_token_ids = parse_reference_token_ids(ngp.reference_token_ids_arg);
             ngp.reference_source = "token-ids";
@@ -1082,13 +1100,16 @@ int main(int argc, char ** argv) {
     ngp.prompt_suffix = string_suffix(params.prompt, 512);
     ngp.chat_generation_prompt = params.sampling.generation_prompt;
     try {
-        if (!ngp.reference_prompt_text_arg.empty()) {
-            const std::string reference_prompt_text = parse_reference_prompt_text(ngp.reference_prompt_text_arg);
+        if (!ngp.reference_prompt_text_arg.empty() || !ngp.reference_prompt_json_arg.empty()) {
+            const bool from_json = !ngp.reference_prompt_json_arg.empty();
+            const std::string reference_prompt_text = from_json ?
+                parse_reference_prompt_json_content(ngp.reference_prompt_json_arg) :
+                parse_reference_prompt_text(ngp.reference_prompt_text_arg);
             ngp.reference_prompt_text_bytes = (int) reference_prompt_text.size();
             ngp.reference_prompt_text_fnv1a64 = fnv1a64_hex(reference_prompt_text);
             ngp.reference_prompt_first_mismatch_byte = first_byte_mismatch(params.prompt, reference_prompt_text);
             ngp.reference_prompt_matches = ngp.reference_prompt_first_mismatch_byte < 0;
-            ngp.reference_prompt_source = "text";
+            ngp.reference_prompt_source = from_json ? "json-prompt" : "text";
         }
     } catch (const std::exception & e) {
         LOG_ERR("%s\n", e.what());
