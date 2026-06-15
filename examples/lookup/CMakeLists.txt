@@ -21,7 +21,8 @@ if(NGPLUS_GEMMA4_LLAMA_ROOT)
         "${NGPLUS_GEMMA4_LLAMA_ROOT}/common"
         "${NGPLUS_GEMMA4_LLAMA_ROOT}/include"
         "${NGPLUS_GEMMA4_LLAMA_ROOT}/ggml/include"
-        "${NGPLUS_GEMMA4_LLAMA_ROOT}/src")
+        "${NGPLUS_GEMMA4_LLAMA_ROOT}/src"
+        "${NGPLUS_GEMMA4_LLAMA_ROOT}/vendor")
     target_link_libraries(${TARGET_NGPLUS_VERIFIER} PRIVATE
         "${NGPLUS_GEMMA4_BIN_DIR}/libllama-common.dylib"
         "${NGPLUS_GEMMA4_BIN_DIR}/libllama.dylib"

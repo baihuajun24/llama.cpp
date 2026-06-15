@@ -1,4 +1,7 @@
 #include "arg.h"
+#ifdef NGPLUS_USE_UPSTREAM_GEMMA4
+#include "chat.h"
+#endif
 #include "common.h"
 #ifdef NGPLUS_USE_UPSTREAM_GEMMA4
 #include "ggml-backend.h"
@@ -31,6 +34,8 @@ struct ngplus_params {
     int effective_ngram_max = 4;
     int effective_draft = 8;
     bool cpu_fallback = false;
+    bool single_turn = true;
+    bool chat_template_applied = false;
     bool no_display_prompt = false;
 };
 
@@ -208,7 +213,7 @@ static std::vector<std::string> preprocess_args(int argc, char ** argv, ngplus_p
         } else if (name == "--no-display-prompt") {
             ngp.no_display_prompt = true;
         } else if (name == "--single-turn") {
-            // Accepted for eval-wrapper compatibility. This non-interactive verifier is always single-turn.
+            ngp.single_turn = true;
         } else if (name == "--offline" || name == "--no-mmproj") {
             // Accepted for eval-wrapper compatibility. They are handled by upstream helpers, not this fork.
         } else if (name == "-hf" || name == "-hfr" || name == "--hf-repo") {
@@ -305,6 +310,37 @@ static std::string json_escape(const std::string & input) {
     return out;
 }
 
+#ifdef NGPLUS_USE_UPSTREAM_GEMMA4
+static bool apply_single_turn_chat_template(common_params & params, llama_model * model) {
+    if (model == nullptr || params.prompt.empty()) {
+        return false;
+    }
+
+    common_chat_templates_ptr chat_templates = common_chat_templates_init(model, params.chat_template);
+    auto caps = common_chat_templates_get_caps(chat_templates.get());
+
+    common_chat_templates_inputs inputs;
+    common_chat_msg user_msg;
+    user_msg.role = "user";
+    user_msg.content = params.prompt;
+    inputs.messages.push_back(std::move(user_msg));
+    inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_NONE;
+    inputs.use_jinja = params.use_jinja;
+    inputs.parallel_tool_calls = caps["supports_parallel_tool_calls"];
+    inputs.add_generation_prompt = true;
+    inputs.reasoning_format = params.reasoning_format;
+    inputs.enable_thinking = false;
+    inputs.chat_template_kwargs = params.default_template_kwargs;
+    inputs.chat_template_kwargs["enable_thinking"] = "false";
+    inputs.force_pure_content = params.force_pure_content_parser;
+
+    const common_chat_params chat_params = common_chat_templates_apply(chat_templates.get(), inputs);
+    params.prompt = chat_params.prompt;
+
+    return true;
+}
+#endif
+
 static prompt_draft_result prompt_local_draft(
         const std::vector<llama_token> & history,
         int max_order,
@@ -377,6 +413,7 @@ static void trace_step(
           << "\"cold_source\":\"noop\","
           << "\"cold_path\":\"" << json_escape(ngp.cold_path) << "\","
           << "\"cold_mmap\":\"" << json_escape(ngp.cold_mmap) << "\","
+          << "\"prompt_format\":\"" << (ngp.chat_template_applied ? "chat-single-turn" : "raw") << "\","
           << "\"device_fallback\":" << (ngp.cpu_fallback ? "\"cpu_no_usable_offload_device\"" : "null") << ","
           << "\"ngram_min\":" << ngp.effective_ngram_min << ","
           << "\"ngram_max\":" << ngp.effective_ngram_max << ","
@@ -453,6 +490,21 @@ int main(int argc, char ** argv) {
         return 1;
     }
     const llama_vocab * vocab = llama_model_get_vocab(model);
+
+#ifdef NGPLUS_USE_UPSTREAM_GEMMA4
+    if (ngp.single_turn) {
+        try {
+            ngp.chat_template_applied = apply_single_turn_chat_template(params, model);
+        } catch (const std::exception & e) {
+            LOG_ERR("failed to apply single-turn chat template for NG+ verification: %s\n", e.what());
+            llama_backend_free();
+            return 1;
+        }
+        if (ngp.chat_template_applied) {
+            LOG_INF("ngplus: applied single-turn chat template with reasoning disabled\n");
+        }
+    }
+#endif
 
     std::vector<llama_token> history = common_tokenize(ctx, params.prompt, true, true);
     if (history.empty()) {
