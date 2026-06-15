@@ -4,6 +4,12 @@ install(TARGETS ${TARGET_LOOKUP} RUNTIME)
 target_link_libraries(${TARGET_LOOKUP} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET_LOOKUP} PRIVATE cxx_std_17)
 
+set(TARGET_NGPLUS_VERIFIER llama-ngplus-verifier)
+add_executable(${TARGET_NGPLUS_VERIFIER} ngplus-verifier.cpp)
+install(TARGETS ${TARGET_NGPLUS_VERIFIER} RUNTIME)
+target_link_libraries(${TARGET_NGPLUS_VERIFIER} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET_NGPLUS_VERIFIER} PRIVATE cxx_std_17)
+
 set(TARGET_LOOKUP_CREATE llama-lookup-create)
 add_executable(${TARGET_LOOKUP_CREATE} lookup-create.cpp)
 install(TARGETS ${TARGET_LOOKUP_CREATE} RUNTIME)
@@ -49,12 +55,14 @@ install(TARGETS ${TARGET_NGRAM_TABLE} RUNTIME)
 target_link_libraries(${TARGET_NGRAM_TABLE} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET_NGRAM_TABLE} PRIVATE cxx_std_17)
 
-# (0707 added) Add the new build-suffix-array executable
-set(TARGET_BUILD_SUFFIX_ARRAY llama-build-suffix-array)
-add_executable(${TARGET_BUILD_SUFFIX_ARRAY} build-suffix-array.cpp ../../common/ngram-suffix.cpp)
-install(TARGETS ${TARGET_BUILD_SUFFIX_ARRAY} RUNTIME)
-target_link_libraries(${TARGET_BUILD_SUFFIX_ARRAY} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
-target_compile_features(${TARGET_BUILD_SUFFIX_ARRAY} PRIVATE cxx_std_17)
+# (0707 added) Add the new build-suffix-array executable when the source is present.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/build-suffix-array.cpp")
+    set(TARGET_BUILD_SUFFIX_ARRAY llama-build-suffix-array)
+    add_executable(${TARGET_BUILD_SUFFIX_ARRAY} build-suffix-array.cpp ../../common/ngram-suffix.cpp)
+    install(TARGETS ${TARGET_BUILD_SUFFIX_ARRAY} RUNTIME)
+    target_link_libraries(${TARGET_BUILD_SUFFIX_ARRAY} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
+    target_compile_features(${TARGET_BUILD_SUFFIX_ARRAY} PRIVATE cxx_std_17)
+endif()
 
 # (0708 added) Add the new sample-ngram-table executable
 set(TARGET_SAMPLE_NGRAM_TABLE llama-sample-ngram-table)
