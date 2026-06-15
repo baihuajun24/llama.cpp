@@ -711,6 +711,43 @@ static std::string top_candidates_json(
     out << "]";
     return out.str();
 }
+
+static std::string reference_candidate_json(
+        llama_context * ctx,
+        common_sampler * smpl,
+        llama_token reference_token,
+        llama_token selected) {
+    if (reference_token < 0) {
+        return "null";
+    }
+
+    llama_token_data_array * candidates = common_sampler_get_candidates(smpl, true);
+    int rank = -1;
+    float logit = NAN;
+    float p = NAN;
+    if (candidates != nullptr) {
+        for (size_t i = 0; i < candidates->size; ++i) {
+            const llama_token_data & candidate = candidates->data[i];
+            if (candidate.id == reference_token) {
+                rank = (int) i + 1;
+                logit = candidate.logit;
+                p = candidate.p;
+                break;
+            }
+        }
+    }
+
+    std::ostringstream out;
+    out << "{"
+        << "\"id\":" << reference_token << ","
+        << "\"piece\":\"" << json_escape(common_token_to_piece(ctx, reference_token)) << "\","
+        << "\"rank\":" << (rank >= 0 ? std::to_string(rank) : "null") << ","
+        << "\"logit\":" << json_float_or_null(logit) << ","
+        << "\"p\":" << json_float_or_null(p) << ","
+        << "\"selected\":" << (reference_token == selected ? "true" : "false")
+        << "}";
+    return out.str();
+}
 #endif
 
 #ifdef NGPLUS_USE_UPSTREAM_GEMMA4
@@ -858,6 +895,7 @@ static void trace_step(
         int reference_token_count,
         int reference_text_bytes,
         const std::string & reference_text_fnv1a64,
+        const std::string & reference_current_candidate,
         int reference_first_mismatch_index,
         llama_token reference_expected_token,
         llama_token reference_actual_token,
@@ -957,6 +995,7 @@ static void trace_step(
           << "\"reference_text_bytes\":" << reference_text_bytes << ","
           << "\"reference_text_fnv1a64\":"
           << (reference_text_fnv1a64.empty() ? "null" : ("\"" + json_escape(reference_text_fnv1a64) + "\"")) << ","
+          << "\"reference_current_candidate\":" << reference_current_candidate << ","
           << "\"reference_prefix_matches\":" << (reference_prefix_matches ? "true" : "false") << ","
           << "\"reference_final_matches\":"
           << (generated_full_sequence_final && reference_token_count > 0 ? (reference_final_matches ? "true" : "false") : "null") << ","
@@ -1223,11 +1262,18 @@ int main(int argc, char ** argv) {
         }
 
         const int64_t t_verify_start_us = ggml_time_us();
+        llama_token reference_current_token = -1;
+        if (generated_token_ids.size() < ngp.reference_token_ids.size()) {
+            reference_current_token = ngp.reference_token_ids[generated_token_ids.size()];
+        }
         const llama_token id = common_sampler_sample(smpl, ctx, -1);
 #ifdef NGPLUS_USE_UPSTREAM_GEMMA4
         const std::string top_candidates = top_candidates_json(ctx, smpl, 5, id);
+        const std::string reference_current_candidate =
+            reference_candidate_json(ctx, smpl, reference_current_token, id);
 #else
         const std::string top_candidates = "[]";
+        const std::string reference_current_candidate = "null";
 #endif
         common_sampler_accept(smpl, id, true);
 
@@ -1343,6 +1389,7 @@ int main(int argc, char ** argv) {
             (int) ngp.reference_token_ids.size(),
             ngp.reference_text_bytes,
             ngp.reference_text_fnv1a64,
+            reference_current_candidate,
             reference_first_mismatch,
             reference_expected_token,
             reference_actual_token,
