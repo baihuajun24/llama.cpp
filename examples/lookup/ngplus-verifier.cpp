@@ -37,6 +37,7 @@ struct ngplus_params {
     bool single_turn = true;
     bool chat_template_applied = false;
     bool prompt_sampler_seeded = false;
+    bool draft_acceptance_enabled = false;
     bool no_display_prompt = false;
 };
 
@@ -416,6 +417,8 @@ static void trace_step(
           << "\"cold_mmap\":\"" << json_escape(ngp.cold_mmap) << "\","
           << "\"prompt_format\":\"" << (ngp.chat_template_applied ? "chat-single-turn" : "raw") << "\","
           << "\"prompt_sampler_seeded\":" << (ngp.prompt_sampler_seeded ? "true" : "false") << ","
+          << "\"verification_mode\":\"ar_exact_prefill_diagnostic_draft\","
+          << "\"draft_acceptance_enabled\":" << (ngp.draft_acceptance_enabled ? "true" : "false") << ","
           << "\"device_fallback\":" << (ngp.cpu_fallback ? "\"cpu_no_usable_offload_device\"" : "null") << ","
           << "\"ngram_min\":" << ngp.effective_ngram_min << ","
           << "\"ngram_max\":" << ngp.effective_ngram_max << ","
@@ -559,27 +562,33 @@ int main(int argc, char ** argv) {
     }
     ngp.prompt_sampler_seeded = true;
 
+    const int batch_capacity = std::max(
+        (int) llama_n_batch(ctx),
+        std::max((int) history.size(), ngp.effective_draft + 1));
+    llama_batch batch_tgt = llama_batch_init(batch_capacity, 0, 1);
+
     const auto t_enc_start = ggml_time_us();
-    if (history.size() > 1) {
-        if (llama_decode(ctx, llama_batch_get_one(history.data(), (int) history.size() - 1)) != 0) {
-            LOG_ERR("failed to evaluate prompt\n");
-            common_sampler_free(smpl);
-            llama_backend_free();
-            return 1;
-        }
+    common_batch_clear(batch_tgt);
+    for (int i = 0; i < (int) history.size(); ++i) {
+        common_batch_add(batch_tgt, history[i], i, { 0 }, i == (int) history.size() - 1);
+    }
+    if (llama_decode(ctx, batch_tgt) != 0) {
+        LOG_ERR("failed to evaluate full prompt for server-aligned NG+ verification\n");
+        common_sampler_free(smpl);
+        llama_batch_free(batch_tgt);
+        llama_backend_free();
+        return 1;
     }
     const auto t_enc_end = ggml_time_us();
 
-    llama_token id_last = history.back();
-    int n_past = (int) history.size() - 1;
-    llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx), 0, 1);
+    int n_past = (int) history.size();
 
     const auto t_dec_start = ggml_time_us();
     int step = 0;
 
     while (!has_eos && (params.n_predict < 0 || n_predict < params.n_predict)) {
-        const int remaining = params.n_predict < 0 ? n_draft + 1 : std::max(1, params.n_predict - n_predict);
-        const int draft_limit = std::max(0, std::min(n_draft, remaining - 1));
+        const int remaining = params.n_predict < 0 ? n_draft : std::max(1, params.n_predict - n_predict);
+        const int draft_limit = std::max(0, std::min(n_draft, remaining));
 
         const int64_t t_draft_start_us = ggml_time_us();
         const prompt_draft_result draft_result = prompt_local_draft(history, ngp.effective_ngram_max, draft_limit);
@@ -587,43 +596,37 @@ int main(int argc, char ** argv) {
 
         const llama_tokens & draft = draft_result.tokens;
 
-        common_batch_clear(batch_tgt);
-        common_batch_add(batch_tgt, id_last, n_past++, { 0 }, true);
-        for (size_t i = 0; i < draft.size(); ++i) {
-            common_batch_add(batch_tgt, draft[i], n_past + (int) i, { 0 }, true);
-        }
-
         const int64_t t_verify_start_us = ggml_time_us();
-        if (llama_decode(ctx, batch_tgt) != 0) {
-            LOG_ERR("target decode failed during NG+ verification\n");
-            break;
-        }
-        const auto ids = common_sampler_sample_and_accept_n(smpl, ctx, draft);
-        const int64_t verify_us = ggml_time_us() - t_verify_start_us;
+        const llama_token id = common_sampler_sample(smpl, ctx, -1);
+        common_sampler_accept(smpl, id, true);
 
-        const int accepted_from_draft = std::max(0, (int) ids.size() - 1);
+        const int accepted_from_draft = 0;
         n_drafted += (int) draft.size();
         n_accept += accepted_from_draft;
-        n_past += accepted_from_draft;
 
-        for (llama_token id : ids) {
-            id_last = id;
-            history.push_back(id);
+        history.push_back(id);
 
-            if (llama_vocab_is_eog(vocab, id)) {
-                has_eos = true;
-                break;
-            }
-
+        if (llama_vocab_is_eog(vocab, id)) {
+            has_eos = true;
+        } else {
             const std::string token_str = common_token_to_piece(ctx, id);
             LOG("%s", token_str.c_str());
             generated_text << token_str;
             ++n_predict;
+        }
 
-            if (params.n_predict >= 0 && n_predict >= params.n_predict) {
+        const bool need_next_logits =
+            !has_eos && (params.n_predict < 0 || n_predict < params.n_predict);
+        if (need_next_logits) {
+            common_batch_clear(batch_tgt);
+            common_batch_add(batch_tgt, id, n_past, { 0 }, true);
+            if (llama_decode(ctx, batch_tgt) != 0) {
+                LOG_ERR("target decode failed during AR-exact NG+ verification\n");
                 break;
             }
+            ++n_past;
         }
+        const int64_t verify_us = ggml_time_us() - t_verify_start_us;
 
         const int64_t t_kv_start_us = ggml_time_us();
 #ifdef NGPLUS_USE_UPSTREAM_GEMMA4
@@ -639,7 +642,7 @@ int main(int argc, char ** argv) {
             ngp,
             (int) draft.size(),
             accepted_from_draft,
-            (int) ids.size(),
+            1,
             draft_result.order,
             draft_result.source_pos,
             draft_us,
