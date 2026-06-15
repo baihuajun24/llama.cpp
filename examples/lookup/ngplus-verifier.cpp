@@ -827,6 +827,48 @@ static std::string sampler_diagnostics_json(
         << "}";
     return out.str();
 }
+
+static std::string logit_surface_json(common_sampler * smpl, int fingerprint_items) {
+    llama_token_data_array * candidates = common_sampler_get_candidates(smpl, true);
+    if (candidates == nullptr || candidates->size == 0) {
+        return "{\"candidate_count\":0,\"top_tokens\":[],\"top_logit\":null,\"second_logit\":null,\"top_margin\":null,\"fingerprint_items\":0,\"fingerprint_fnv1a64\":null}";
+    }
+
+    const int n_items = std::max(0, std::min(fingerprint_items, (int) candidates->size));
+    float top_logit = candidates->data[0].logit;
+    float second_logit = candidates->size > 1 ? candidates->data[1].logit : NAN;
+    float top_margin = candidates->size > 1 ? top_logit - second_logit : NAN;
+
+    std::ostringstream payload;
+    payload << std::setprecision(9);
+    std::ostringstream top_tokens;
+    top_tokens << "[";
+    for (int i = 0; i < n_items; ++i) {
+        const llama_token_data & candidate = candidates->data[i];
+        if (i > 0) {
+            top_tokens << ",";
+            payload << ";";
+        }
+        top_tokens << candidate.id;
+        payload
+            << candidate.id << ":"
+            << candidate.logit << ":"
+            << candidate.p;
+    }
+    top_tokens << "]";
+
+    std::ostringstream out;
+    out << "{"
+        << "\"candidate_count\":" << (int) candidates->size << ","
+        << "\"top_tokens\":" << top_tokens.str() << ","
+        << "\"top_logit\":" << json_float_or_null(top_logit) << ","
+        << "\"second_logit\":" << json_float_or_null(second_logit) << ","
+        << "\"top_margin\":" << json_float_or_null(top_margin) << ","
+        << "\"fingerprint_items\":" << n_items << ","
+        << "\"fingerprint_fnv1a64\":\"" << fnv1a64_hex(payload.str()) << "\""
+        << "}";
+    return out.str();
+}
 #endif
 
 #ifdef NGPLUS_USE_UPSTREAM_GEMMA4
@@ -971,6 +1013,7 @@ static void trace_step(
         const std::string & generated_token_pieces_tail,
         const std::string & top_candidates,
         const std::string & sampler_diagnostics,
+        const std::string & logit_surface,
         llama_token sampler_selected_token,
         const std::string & sampler_selected_piece,
         bool reference_forced,
@@ -1029,6 +1072,7 @@ static void trace_step(
           << "\"server_backend_sampling\":" << (ngp.server_backend_sampling ? "true" : "false") << ","
           << "\"sampler_chain\":\"" << json_escape(ngp.sampler_chain) << "\","
           << "\"sampler_diagnostics\":" << sampler_diagnostics << ","
+          << "\"logit_surface\":" << logit_surface << ","
           << "\"verification_mode\":\"ar_exact_prefill_diagnostic_draft\","
           << "\"draft_acceptance_enabled\":" << (ngp.draft_acceptance_enabled ? "true" : "false") << ","
           << "\"device_fallback\":" << (ngp.cpu_fallback ? "\"cpu_no_usable_offload_device\"" : "null") << ","
@@ -1379,11 +1423,13 @@ int main(int argc, char ** argv) {
         const std::string top_candidates = top_candidates_json(ctx, smpl, 5, id);
         const std::string sampler_diagnostics =
             sampler_diagnostics_json(smpl, params.sampling, sampler_selected_token);
+        const std::string logit_surface = logit_surface_json(smpl, 32);
         const std::string reference_current_candidate =
             reference_candidate_json(ctx, smpl, reference_current_token, id);
 #else
         const std::string top_candidates = "[]";
         const std::string sampler_diagnostics = "null";
+        const std::string logit_surface = "null";
         const std::string reference_current_candidate = "null";
 #endif
         common_sampler_accept(smpl, id, true);
@@ -1497,6 +1543,7 @@ int main(int argc, char ** argv) {
             token_pieces_tail_json(ctx, generated_token_ids, 16),
             top_candidates,
             sampler_diagnostics,
+            logit_surface,
             sampler_selected_token,
             sampler_selected_piece,
             reference_forced,
