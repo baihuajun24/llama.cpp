@@ -48,6 +48,8 @@ struct ngplus_params {
     std::string prompt_fingerprint;
     std::string prompt_token_head_json = "[]";
     std::string prompt_token_tail_json = "[]";
+    std::string prompt_token_head_pieces_json = "[]";
+    std::string prompt_token_tail_pieces_json = "[]";
     std::string prompt_suffix;
     std::string chat_generation_prompt;
     bool chat_grammar_lazy = false;
@@ -377,6 +379,41 @@ static std::string token_ids_tail_json(const std::vector<llama_token> & tokens, 
     return token_ids_json(tokens, begin, tokens.size());
 }
 
+static std::string token_pieces_json(
+        llama_context * ctx,
+        const std::vector<llama_token> & tokens,
+        size_t begin,
+        size_t end) {
+    std::ostringstream out;
+    out << "[";
+    const size_t n = tokens.size();
+    begin = std::min(begin, n);
+    end = std::min(end, n);
+    for (size_t i = begin; i < end; ++i) {
+        if (i > begin) {
+            out << ",";
+        }
+        out << "\"" << json_escape(common_token_to_piece(ctx, tokens[i])) << "\"";
+    }
+    out << "]";
+    return out.str();
+}
+
+static std::string token_pieces_prefix_json(
+        llama_context * ctx,
+        const std::vector<llama_token> & tokens,
+        size_t max_items) {
+    return token_pieces_json(ctx, tokens, 0, std::min(max_items, tokens.size()));
+}
+
+static std::string token_pieces_tail_json(
+        llama_context * ctx,
+        const std::vector<llama_token> & tokens,
+        size_t max_items) {
+    const size_t begin = tokens.size() > max_items ? tokens.size() - max_items : 0;
+    return token_pieces_json(ctx, tokens, begin, tokens.size());
+}
+
 static std::string string_suffix(const std::string & input, size_t max_bytes) {
     if (input.size() <= max_bytes) {
         return input;
@@ -546,6 +583,8 @@ static void trace_step(
         const std::string & generated_prefix,
         const std::string & generated_token_ids_prefix,
         const std::string & generated_token_ids_tail,
+        const std::string & generated_token_pieces_prefix,
+        const std::string & generated_token_pieces_tail,
         const std::string & top_candidates) {
     if (!trace.is_open()) {
         return;
@@ -565,6 +604,8 @@ static void trace_step(
           << "\"prompt_fingerprint\":\"" << ngp.prompt_fingerprint << "\","
           << "\"prompt_token_head\":" << ngp.prompt_token_head_json << ","
           << "\"prompt_token_tail\":" << ngp.prompt_token_tail_json << ","
+          << "\"prompt_token_head_pieces\":" << ngp.prompt_token_head_pieces_json << ","
+          << "\"prompt_token_tail_pieces\":" << ngp.prompt_token_tail_pieces_json << ","
           << "\"prompt_suffix\":\"" << json_escape(ngp.prompt_suffix) << "\","
           << "\"chat_generation_prompt\":\"" << json_escape(ngp.chat_generation_prompt) << "\","
           << "\"chat_grammar_lazy\":" << (ngp.chat_grammar_lazy ? "true" : "false") << ","
@@ -602,6 +643,8 @@ static void trace_step(
           << "\"generated_prefix\":\"" << json_escape(generated_prefix) << "\","
           << "\"generated_token_ids_prefix\":" << generated_token_ids_prefix << ","
           << "\"generated_token_ids_tail\":" << generated_token_ids_tail << ","
+          << "\"generated_token_pieces_prefix\":" << generated_token_pieces_prefix << ","
+          << "\"generated_token_pieces_tail\":" << generated_token_pieces_tail << ","
           << "\"top_candidates\":" << top_candidates
           << "}\n";
 }
@@ -690,6 +733,8 @@ int main(int argc, char ** argv) {
     ngp.prompt_fingerprint = fnv1a64_hex(params.prompt);
     ngp.prompt_token_head_json = token_ids_json(history, 0, std::min<size_t>(16, history.size()));
     ngp.prompt_token_tail_json = token_ids_json(history, history.size() > 16 ? history.size() - 16 : 0, history.size());
+    ngp.prompt_token_head_pieces_json = token_pieces_json(ctx, history, 0, std::min<size_t>(16, history.size()));
+    ngp.prompt_token_tail_pieces_json = token_pieces_json(ctx, history, history.size() > 16 ? history.size() - 16 : 0, history.size());
     ngp.prompt_suffix = string_suffix(params.prompt, 512);
     ngp.chat_generation_prompt = params.sampling.generation_prompt;
 
@@ -857,6 +902,8 @@ int main(int argc, char ** argv) {
             string_prefix(generated_text.str(), 256),
             token_ids_prefix_json(generated_token_ids, 32),
             token_ids_tail_json(generated_token_ids, 16),
+            token_pieces_prefix_json(ctx, generated_token_ids, 32),
+            token_pieces_tail_json(ctx, generated_token_ids, 16),
             top_candidates);
         previous_sampled_token = id;
         previous_sampled_piece = llama_vocab_is_eog(vocab, id) ? std::string() : common_token_to_piece(ctx, id);
