@@ -33,10 +33,16 @@ struct ngplus_params {
     std::string reference_token_ids_arg;
     std::string reference_text_arg;
     std::string reference_json_arg;
+    std::string reference_prompt_text_arg;
     std::vector<llama_token> reference_token_ids;
     int reference_text_bytes = 0;
     std::string reference_text_fnv1a64;
     std::string reference_source = "none";
+    int reference_prompt_text_bytes = 0;
+    std::string reference_prompt_text_fnv1a64;
+    std::string reference_prompt_source = "none";
+    int reference_prompt_first_mismatch_byte = -1;
+    bool reference_prompt_matches = false;
     int hot_ngram_max = 6;
     int draft = 8;
     int tree_budget = 64;
@@ -106,6 +112,8 @@ static void print_ngplus_usage(int, char **) {
     printf("                                optional generated reference text to tokenize for trace exactness diagnostics\n");
     printf("  --ngplus-reference-json JSON|@FILE\n");
     printf("                                optional OpenAI-compatible response JSON; extracts choices[0].message.content\n");
+    printf("  --ngplus-reference-prompt-text TEXT|@FILE\n");
+    printf("                                optional formatted prompt text for trace prompt-template diagnostics\n");
 }
 
 static std::string require_value(int argc, char ** argv, int & i, const std::string & arg) {
@@ -266,6 +274,8 @@ static std::vector<std::string> preprocess_args(int argc, char ** argv, ngplus_p
             ngp.reference_text_arg = value_for(name);
         } else if (name == "--ngplus-reference-json") {
             ngp.reference_json_arg = value_for(name);
+        } else if (name == "--ngplus-reference-prompt-text") {
+            ngp.reference_prompt_text_arg = value_for(name);
         } else if (name == "-o" || name == "--output" || name == "--output-file") {
             ngp.out_file = value_for(name);
         } else if (name == "--no-display-prompt") {
@@ -461,6 +471,20 @@ static std::string read_inline_or_at_file(const std::string & spec, const std::s
 
 static std::string parse_reference_text(const std::string & spec) {
     return read_inline_or_at_file(spec, "--ngplus-reference-text");
+}
+
+static std::string parse_reference_prompt_text(const std::string & spec) {
+    return read_inline_or_at_file(spec, "--ngplus-reference-prompt-text");
+}
+
+static int first_byte_mismatch(const std::string & actual, const std::string & expected) {
+    const size_t common = std::min(actual.size(), expected.size());
+    for (size_t i = 0; i < common; ++i) {
+        if (actual[i] != expected[i]) {
+            return (int) i;
+        }
+    }
+    return actual.size() == expected.size() ? -1 : (int) common;
 }
 
 static std::string parse_json_string_at(const std::string & payload, size_t quote_pos) {
@@ -851,6 +875,14 @@ static void trace_step(
           << "\"prompt_suffix\":\"" << json_escape(ngp.prompt_suffix) << "\","
           << "\"prompt_text_final\":"
           << (generated_full_sequence_final ? ("\"" + json_escape(ngp.prompt_text) + "\"") : "null") << ","
+          << "\"prompt_reference_source\":\"" << json_escape(ngp.reference_prompt_source) << "\","
+          << "\"prompt_reference_text_bytes\":" << ngp.reference_prompt_text_bytes << ","
+          << "\"prompt_reference_text_fnv1a64\":"
+          << (ngp.reference_prompt_text_fnv1a64.empty() ? "null" : ("\"" + json_escape(ngp.reference_prompt_text_fnv1a64) + "\"")) << ","
+          << "\"prompt_reference_matches\":"
+          << (ngp.reference_prompt_source == "none" ? "null" : (ngp.reference_prompt_matches ? "true" : "false")) << ","
+          << "\"prompt_reference_first_mismatch_byte\":"
+          << (ngp.reference_prompt_first_mismatch_byte >= 0 ? std::to_string(ngp.reference_prompt_first_mismatch_byte) : "null") << ","
           << "\"chat_generation_prompt\":\"" << json_escape(ngp.chat_generation_prompt) << "\","
           << "\"chat_grammar_lazy\":" << (ngp.chat_grammar_lazy ? "true" : "false") << ","
           << "\"reasoning_budget_start_tokens\":" << ngp.reasoning_budget_start_tokens << ","
@@ -1049,6 +1081,20 @@ int main(int argc, char ** argv) {
     ngp.prompt_text = params.prompt;
     ngp.prompt_suffix = string_suffix(params.prompt, 512);
     ngp.chat_generation_prompt = params.sampling.generation_prompt;
+    try {
+        if (!ngp.reference_prompt_text_arg.empty()) {
+            const std::string reference_prompt_text = parse_reference_prompt_text(ngp.reference_prompt_text_arg);
+            ngp.reference_prompt_text_bytes = (int) reference_prompt_text.size();
+            ngp.reference_prompt_text_fnv1a64 = fnv1a64_hex(reference_prompt_text);
+            ngp.reference_prompt_first_mismatch_byte = first_byte_mismatch(params.prompt, reference_prompt_text);
+            ngp.reference_prompt_matches = ngp.reference_prompt_first_mismatch_byte < 0;
+            ngp.reference_prompt_source = "text";
+        }
+    } catch (const std::exception & e) {
+        LOG_ERR("%s\n", e.what());
+        llama_backend_free();
+        return 1;
+    }
 
     const int64_t t_hot_init_start_us = ggml_time_us();
     const int64_t t_hot_init_us = ggml_time_us() - t_hot_init_start_us;
