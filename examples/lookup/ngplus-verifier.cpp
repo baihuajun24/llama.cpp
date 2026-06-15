@@ -378,6 +378,22 @@ static std::string fnv1a64_hex(const std::string & input) {
     return out.str();
 }
 
+static std::string openai_response_json_for_text(
+        const std::string & generated_text,
+        int generated_text_bytes,
+        const std::string & generated_text_fnv1a64) {
+    std::ostringstream out;
+    out << "{"
+        << "\"object\":\"ngplus.trace.response\","
+        << "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\""
+        << json_escape(generated_text)
+        << "\"},\"finish_reason\":\"length\"}],"
+        << "\"ngplus_generated_text_bytes\":" << generated_text_bytes << ","
+        << "\"ngplus_generated_text_fnv1a64\":\"" << json_escape(generated_text_fnv1a64) << "\""
+        << "}";
+    return out.str();
+}
+
 static std::string json_float_or_null(float value) {
     if (!std::isfinite(value)) {
         return "null";
@@ -790,6 +806,7 @@ static void trace_step(
         const std::string & generated_text_final,
         int generated_text_bytes,
         const std::string & generated_text_fnv1a64,
+        const std::string & generated_response_json_final,
         const std::string & generated_token_ids,
         const std::string & generated_token_ids_prefix,
         const std::string & generated_token_ids_tail,
@@ -876,6 +893,8 @@ static void trace_step(
           << "\"generated_text_final\":\"" << json_escape(generated_text_final) << "\","
           << "\"generated_text_bytes\":" << generated_text_bytes << ","
           << "\"generated_text_fnv1a64\":\"" << json_escape(generated_text_fnv1a64) << "\","
+          << "\"generated_response_json_final\":"
+          << (generated_response_json_final.empty() ? "null" : generated_response_json_final) << ","
           << "\"generated_token_ids\":" << generated_token_ids << ","
           << "\"generated_token_ids_prefix\":" << generated_token_ids_prefix << ","
           << "\"generated_token_ids_tail\":" << generated_token_ids_tail << ","
@@ -1183,6 +1202,15 @@ int main(int argc, char ** argv) {
             has_reference && generated_full_sequence_final &&
             reference_prefix_matches &&
             generated_token_ids.size() == ngp.reference_token_ids.size();
+        const std::string generated_text_fnv1a64 =
+            generated_full_sequence_final ? fnv1a64_hex(generated_text_snapshot) : std::string();
+        const std::string generated_response_json_final =
+            generated_full_sequence_final ?
+                openai_response_json_for_text(
+                    generated_text_snapshot,
+                    (int) generated_text_snapshot.size(),
+                    generated_text_fnv1a64) :
+                std::string();
         llama_token reference_expected_token = -1;
         llama_token reference_actual_token = -1;
         if (has_reference) {
@@ -1226,7 +1254,8 @@ int main(int argc, char ** argv) {
             string_prefix(generated_text_snapshot, 256),
             generated_full_sequence_final ? generated_text_snapshot : std::string(),
             (int) generated_text_snapshot.size(),
-            generated_full_sequence_final ? fnv1a64_hex(generated_text_snapshot) : std::string(),
+            generated_text_fnv1a64,
+            generated_response_json_final,
             generated_full_sequence_final ? token_ids_json(generated_token_ids, 0, generated_token_ids.size()) : "[]",
             token_ids_prefix_json(generated_token_ids, 32),
             token_ids_tail_json(generated_token_ids, 16),
