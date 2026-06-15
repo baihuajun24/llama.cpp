@@ -36,6 +36,7 @@ struct ngplus_params {
     std::string reference_prompt_text_arg;
     std::string reference_prompt_json_arg;
     std::vector<llama_token> reference_token_ids;
+    bool stop_after_reference_mismatch = false;
     int reference_text_bytes = 0;
     std::string reference_text_fnv1a64;
     std::string reference_source = "none";
@@ -117,6 +118,8 @@ static void print_ngplus_usage(int, char **) {
     printf("                                optional formatted prompt text for trace prompt-template diagnostics\n");
     printf("  --ngplus-reference-prompt-json JSON|@FILE\n");
     printf("                                optional server /apply-template JSON; extracts prompt for trace diagnostics\n");
+    printf("  --ngplus-stop-after-reference-mismatch\n");
+    printf("                                stop reference replay after the first mismatching generated token\n");
 }
 
 static std::string require_value(int argc, char ** argv, int & i, const std::string & arg) {
@@ -281,6 +284,8 @@ static std::vector<std::string> preprocess_args(int argc, char ** argv, ngplus_p
             ngp.reference_prompt_text_arg = value_for(name);
         } else if (name == "--ngplus-reference-prompt-json") {
             ngp.reference_prompt_json_arg = value_for(name);
+        } else if (name == "--ngplus-stop-after-reference-mismatch") {
+            ngp.stop_after_reference_mismatch = true;
         } else if (name == "-o" || name == "--output" || name == "--output-file") {
             ngp.out_file = value_for(name);
         } else if (name == "--no-display-prompt") {
@@ -991,6 +996,7 @@ static void trace_step(
           << "\"generated_token_pieces_prefix\":" << generated_token_pieces_prefix << ","
           << "\"generated_token_pieces_tail\":" << generated_token_pieces_tail << ","
           << "\"reference_source\":\"" << json_escape(reference_source) << "\","
+          << "\"reference_stop_after_mismatch\":" << (ngp.stop_after_reference_mismatch ? "true" : "false") << ","
           << "\"reference_token_count\":" << reference_token_count << ","
           << "\"reference_text_bytes\":" << reference_text_bytes << ","
           << "\"reference_text_fnv1a64\":"
@@ -1400,6 +1406,10 @@ int main(int argc, char ** argv) {
             generated_full_sequence_final);
         previous_sampled_token = id;
         previous_sampled_piece = llama_vocab_is_eog(vocab, id) ? std::string() : common_token_to_piece(ctx, id);
+
+        if (ngp.stop_after_reference_mismatch && has_reference && reference_first_mismatch >= 0) {
+            break;
+        }
     }
 
     const auto t_dec_end = ggml_time_us();
