@@ -36,6 +36,7 @@ struct ngplus_params {
     bool cpu_fallback = false;
     bool single_turn = true;
     bool chat_template_applied = false;
+    bool prompt_sampler_seeded = false;
     bool no_display_prompt = false;
 };
 
@@ -414,6 +415,7 @@ static void trace_step(
           << "\"cold_path\":\"" << json_escape(ngp.cold_path) << "\","
           << "\"cold_mmap\":\"" << json_escape(ngp.cold_mmap) << "\","
           << "\"prompt_format\":\"" << (ngp.chat_template_applied ? "chat-single-turn" : "raw") << "\","
+          << "\"prompt_sampler_seeded\":" << (ngp.prompt_sampler_seeded ? "true" : "false") << ","
           << "\"device_fallback\":" << (ngp.cpu_fallback ? "\"cpu_no_usable_offload_device\"" : "null") << ","
           << "\"ngram_min\":" << ngp.effective_ngram_min << ","
           << "\"ngram_max\":" << ngp.effective_ngram_max << ","
@@ -551,6 +553,11 @@ int main(int argc, char ** argv) {
 
     std::stringstream generated_text;
     struct common_sampler * smpl = common_sampler_init(model, params.sampling);
+    common_sampler_reset(smpl);
+    for (llama_token id : history) {
+        common_sampler_accept(smpl, id, false);
+    }
+    ngp.prompt_sampler_seeded = true;
 
     const auto t_enc_start = ggml_time_us();
     if (history.size() > 1) {
