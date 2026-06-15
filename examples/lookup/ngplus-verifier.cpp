@@ -52,6 +52,9 @@ struct ngplus_params {
     bool no_display_prompt = false;
     int prompt_tokens = 0;
     int prompt_bytes = 0;
+    int prompt_local_drafted_tokens = 0;
+    int recent_generation_drafted_tokens = 0;
+    int fallback_steps = 0;
     std::string prompt_fingerprint;
     std::string prompt_token_head_json = "[]";
     std::string prompt_token_tail_json = "[]";
@@ -71,6 +74,16 @@ struct prompt_draft_result {
     int order = 0;
     int source_pos = -1;
 };
+
+static std::string draft_source_label(const prompt_draft_result & draft_result, int prompt_tokens) {
+    if (draft_result.tokens.empty()) {
+        return "fallback";
+    }
+    if (draft_result.source_pos >= 0 && draft_result.source_pos + draft_result.order <= prompt_tokens) {
+        return "prompt-local-hot";
+    }
+    return "recent-generation-hot";
+}
 
 static void print_ngplus_usage(int, char **) {
     printf("\n----- ngplus verifier params -----\n\n");
@@ -760,6 +773,7 @@ static void trace_step(
         llama_token previous_sampled_token,
         const std::string & sampled_piece,
         const std::string & previous_sampled_piece,
+        const std::string & draft_source,
         const std::string & generated_prefix,
         const std::string & generated_token_ids,
         const std::string & generated_token_ids_prefix,
@@ -784,7 +798,7 @@ static void trace_step(
     trace << "{"
           << "\"event\":\"step\","
           << "\"step\":" << step << ","
-          << "\"source\":\"" << (drafted_tokens > 0 ? "prompt-local-hot" : "fallback") << "\","
+          << "\"source\":\"" << json_escape(draft_source) << "\","
           << "\"hot_source\":\"" << json_escape(ngp.hot_source) << "\","
           << "\"cold_source\":\"noop\","
           << "\"cold_path\":\"" << json_escape(ngp.cold_path) << "\","
@@ -818,6 +832,9 @@ static void trace_step(
           << "\"tree_budget\":" << ngp.tree_budget << ","
           << "\"drafted_tokens\":" << drafted_tokens << ","
           << "\"accepted_tokens\":" << accepted_tokens << ","
+          << "\"prompt_local_drafted_tokens_total\":" << ngp.prompt_local_drafted_tokens << ","
+          << "\"recent_generation_drafted_tokens_total\":" << ngp.recent_generation_drafted_tokens << ","
+          << "\"fallback_steps_total\":" << ngp.fallback_steps << ","
           << "\"target_tokens\":" << target_tokens << ","
           << "\"fallback\":" << (drafted_tokens > 0 ? "false" : "true") << ","
           << "\"fallback_reason\":" << (drafted_tokens > 0 ? "null" : "\"no_prompt_local_candidate\"") << ","
@@ -1072,6 +1089,14 @@ int main(int argc, char ** argv) {
         const int64_t draft_us = ggml_time_us() - t_draft_start_us;
 
         const llama_tokens & draft = draft_result.tokens;
+        const std::string draft_source = draft_source_label(draft_result, ngp.prompt_tokens);
+        if (draft_source == "prompt-local-hot") {
+            ngp.prompt_local_drafted_tokens += (int) draft.size();
+        } else if (draft_source == "recent-generation-hot") {
+            ngp.recent_generation_drafted_tokens += (int) draft.size();
+        } else {
+            ++ngp.fallback_steps;
+        }
 
         const int64_t t_verify_start_us = ggml_time_us();
         const llama_token id = common_sampler_sample(smpl, ctx, -1);
@@ -1157,6 +1182,7 @@ int main(int argc, char ** argv) {
             previous_sampled_token,
             llama_vocab_is_eog(vocab, id) ? std::string() : common_token_to_piece(ctx, id),
             previous_sampled_piece,
+            draft_source,
             string_prefix(generated_text.str(), 256),
             generated_full_sequence_final ? token_ids_json(generated_token_ids, 0, generated_token_ids.size()) : "[]",
             token_ids_prefix_json(generated_token_ids, 32),
@@ -1191,6 +1217,9 @@ int main(int argc, char ** argv) {
     LOG_INF("n_draft      = %d\n", n_draft);
     LOG_INF("n_predict    = %d\n", n_predict);
     LOG_INF("n_drafted    = %d\n", n_drafted);
+    LOG_INF("n_drafted_prompt_local = %d\n", ngp.prompt_local_drafted_tokens);
+    LOG_INF("n_drafted_recent_gen   = %d\n", ngp.recent_generation_drafted_tokens);
+    LOG_INF("fallback_steps         = %d\n", ngp.fallback_steps);
     LOG_INF("n_accept     = %d\n", n_accept);
     LOG_INF("accept       = %.3f%%\n", n_drafted > 0 ? 100.0f * n_accept / n_drafted : 0.0f);
 
