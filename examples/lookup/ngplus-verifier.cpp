@@ -81,6 +81,7 @@ struct ngplus_params {
     bool batched_verify_enabled = false;          // Phase 5: correct batched spec verify (vs blind)
     int batched_verify_max_k = 0;                  // Phase 5: cap verified batch length (0 = no cap)
     bool hot_table_chain_enabled = false;         // Phase 5: chained multi-token code-store drafts
+    bool structure_indent_enabled = false;        // Phase 5: model-free indentation drafter
     int static_hot_table_candidate_min_count = 2;
     int static_hot_table_candidate_min_top_share_pct = 50;
     int static_hot_table_order = 0;
@@ -380,6 +381,9 @@ static void normalize_phase4_source_args(ngplus_params & ngp) {
     }
     if (has_csv_token(ngp.hot_source, "hot-table-chain")) {
         ngp.hot_table_chain_enabled = true;
+    }
+    if (has_csv_token(ngp.hot_source, "structure-indent")) {
+        ngp.structure_indent_enabled = true;
     }
     // optional cap token "bv-k<N>" e.g. bv-k4 caps the correct verification batch length
     {
@@ -2090,6 +2094,43 @@ int main(int argc, char ** argv) {
                 ngp.recent_generation_min_order, draft_limit);
         }
 
+        // Phase 5 high-leap (iter7): model-free structure-aware indentation drafter. After a token
+        // that ends a line, draft the leading-whitespace tokens of the line that just ended (Python
+        // body code usually repeats indentation). No corpus needed; verified per-token (exact).
+        if (draft_result.tokens.empty() && ngp.structure_indent_enabled && draft_limit > 0 &&
+                history.size() >= 2) {
+            const std::string last_piece = common_token_to_piece(ctx, history.back());
+            if (last_piece.find('\n') != std::string::npos) {
+                const int end = (int) history.size() - 1; // newline token index
+                int prev_nl = -1;
+                for (int i = end - 1; i >= 0 && end - i < 200; --i) {
+                    if (common_token_to_piece(ctx, history[i]).find('\n') != std::string::npos) {
+                        prev_nl = i;
+                        break;
+                    }
+                }
+                prompt_draft_result r;
+                for (int i = prev_nl + 1; i < end && (int) r.tokens.size() < draft_limit; ++i) {
+                    const std::string p = common_token_to_piece(ctx, history[i]);
+                    bool ws = !p.empty();
+                    for (char c : p) {
+                        if (c != ' ' && c != '\t' && c != '\n') { ws = false; break; }
+                    }
+                    if (!ws) {
+                        break;
+                    }
+                    r.tokens.push_back(history[i]);
+                }
+                if (!r.tokens.empty()) {
+                    r.order = 0;
+                    r.source_label = "structure-indent";
+                    r.continuation_copied = (int) r.tokens.size();
+                    r.continuation_available = (int) r.tokens.size();
+                    draft_result = r;
+                }
+            }
+        }
+
         const llama_tokens & draft = draft_result.tokens;
         const std::string draft_source = draft_source_label(draft_result, ngp.prompt_tokens);
         if (draft_source == "prompt-local-hot") {
@@ -2098,7 +2139,7 @@ int main(int argc, char ** argv) {
             ngp.recent_generation_drafted_tokens += (int) draft.size();
         } else if (draft_source == "static-hot-table") {
             ngp.static_hot_table_drafted_tokens += (int) draft.size();
-        } else {
+        } else if (draft.empty()) {
             ++ngp.fallback_steps;
         }
 
