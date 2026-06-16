@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <unordered_map>
@@ -88,8 +89,10 @@ struct ngplus_params {
     int64_t static_hot_table_bytes = 0;
     int64_t static_hot_table_load_us = 0;
     bool cold_store_enabled = false;
+    bool cold_store_indexed = false;
     bool cold_store_loaded = false;
     int cold_store_order = 0;
+    int64_t cold_store_records = 0;
     int64_t cold_store_bytes = 0;
     int64_t cold_store_load_us = 0;
     int cold_store_hits = 0;
@@ -151,6 +154,9 @@ struct cold_mmap_store {
     const char * data = nullptr;
     int64_t bytes = 0;
     int order = 0;
+    bool indexed = false;
+    uint64_t record_count = 0;
+    uint64_t record_size = 0;
 };
 
 struct cold_mmap_lookup_result {
@@ -199,6 +205,7 @@ static void print_ngplus_usage(int, char **) {
     printf("  --ngplus-hot-source SOURCES   comma-separated hot sources (default: prompt,hot-table)\n");
     printf("                                include hot-table-candidates to enable guarded static table drafts\n");
     printf("                                include cold-store to enable read-only mmap cold lookup accounting\n");
+    printf("                                include cold-store-indexed to mmap the .coldidx lookup sidecar\n");
     printf("  --ngplus-hot-table-path FNAME load a Phase 4 static hot-table JSONL source for trace accounting\n");
     printf("  --ngplus-hot-table-candidates on|off\n");
     printf("                                allow high-confidence static hot-table one-token drafts (default: off)\n");
@@ -306,6 +313,26 @@ static bool ends_with(const std::string & value, const std::string & suffix) {
         value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
+static std::string cold_index_path_for_jsonl(const std::string & path) {
+    const std::string suffix = ".jsonl";
+    if (ends_with(path, suffix)) {
+        return path.substr(0, path.size() - suffix.size()) + ".coldidx";
+    }
+    return path + ".coldidx";
+}
+
+static uint32_t read_le32(const char * data) {
+    uint32_t value = 0;
+    std::memcpy(&value, data, sizeof(value));
+    return value;
+}
+
+static uint64_t read_le64(const char * data) {
+    uint64_t value = 0;
+    std::memcpy(&value, data, sizeof(value));
+    return value;
+}
+
 #ifdef NGPLUS_USE_UPSTREAM_GEMMA4
 static bool is_inspection_arg(const std::string & name) {
     return name == "-h" || name == "--help" || name == "--usage" || name == "--list-devices";
@@ -398,6 +425,11 @@ static void normalize_phase4_source_args(ngplus_params & ngp) {
     if (has_csv_token(ngp.hot_source, "cold-store") ||
             has_csv_token(ngp.hot_source, "mmap-cold-store")) {
         ngp.cold_store_enabled = true;
+    }
+    if (has_csv_token(ngp.hot_source, "cold-store-indexed") ||
+            has_csv_token(ngp.hot_source, "indexed-cold-store")) {
+        ngp.cold_store_enabled = true;
+        ngp.cold_store_indexed = true;
     }
     if (ngp.hot_table_path.empty() && !ngp.cold_path.empty() && ends_with(ngp.cold_path, ".jsonl")) {
         ngp.hot_table_path = ngp.cold_path;
@@ -1484,39 +1516,58 @@ static int infer_jsonl_context_order(const char * data, int64_t bytes) {
     return order;
 }
 
-static cold_mmap_store load_cold_mmap_store(const std::string & path) {
+static void close_cold_mmap_store(cold_mmap_store & store);
+
+static cold_mmap_store load_cold_mmap_store(const std::string & path, bool indexed) {
     cold_mmap_store store;
     if (path.empty()) {
         return store;
     }
+    const std::string mmap_path = indexed ? cold_index_path_for_jsonl(path) : path;
 
-    store.fd = open(path.c_str(), O_RDONLY);
+    store.fd = open(mmap_path.c_str(), O_RDONLY);
     if (store.fd < 0) {
-        throw std::invalid_argument("failed to open --ngplus-cold-path for mmap: " + path);
+        throw std::invalid_argument("failed to open cold mmap path: " + mmap_path);
     }
 
     struct stat st;
     if (fstat(store.fd, &st) != 0) {
         close(store.fd);
         store.fd = -1;
-        throw std::invalid_argument("failed to stat --ngplus-cold-path for mmap: " + path);
+        throw std::invalid_argument("failed to stat cold mmap path: " + mmap_path);
     }
     if (st.st_size <= 0) {
         close(store.fd);
         store.fd = -1;
-        throw std::invalid_argument("--ngplus-cold-path is empty: " + path);
+        throw std::invalid_argument("cold mmap path is empty: " + mmap_path);
     }
 
     void * mapped = mmap(nullptr, (size_t) st.st_size, PROT_READ, MAP_PRIVATE, store.fd, 0);
     if (mapped == MAP_FAILED) {
         close(store.fd);
         store.fd = -1;
-        throw std::invalid_argument("failed to mmap --ngplus-cold-path: " + path);
+        throw std::invalid_argument("failed to mmap cold path: " + mmap_path);
     }
 
     store.data = static_cast<const char *>(mapped);
     store.bytes = (int64_t) st.st_size;
-    store.order = infer_jsonl_context_order(store.data, store.bytes);
+    store.indexed = indexed;
+    if (indexed) {
+        if (store.bytes < 64 || std::memcmp(store.data, "NGP4CID1", 8) != 0) {
+            close_cold_mmap_store(store);
+            throw std::invalid_argument("invalid cold index header: " + mmap_path);
+        }
+        store.order = (int) read_le32(store.data + 8);
+        store.record_count = read_le64(store.data + 16);
+        store.record_size = (uint64_t) store.order * sizeof(uint32_t) + sizeof(uint64_t) + 4 * sizeof(uint32_t);
+        const uint64_t expected_bytes = 64 + store.record_count * store.record_size;
+        if (store.order <= 0 || store.record_size <= sizeof(uint64_t) || expected_bytes > (uint64_t) store.bytes) {
+            close_cold_mmap_store(store);
+            throw std::invalid_argument("invalid cold index dimensions: " + mmap_path);
+        }
+    } else {
+        store.order = infer_jsonl_context_order(store.data, store.bytes);
+    }
     return store;
 }
 
@@ -1531,6 +1582,27 @@ static void close_cold_mmap_store(cold_mmap_store & store) {
     store.fd = -1;
     store.bytes = 0;
     store.order = 0;
+    store.indexed = false;
+    store.record_count = 0;
+    store.record_size = 0;
+}
+
+static int compare_cold_index_record(
+        const char * record,
+        const std::vector<llama_token> & history,
+        int order) {
+    const int start = (int) history.size() - order;
+    for (int i = 0; i < order; ++i) {
+        const uint32_t lhs = read_le32(record + i * sizeof(uint32_t));
+        const uint32_t rhs = (uint32_t) history[start + i];
+        if (lhs < rhs) {
+            return -1;
+        }
+        if (lhs > rhs) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static cold_mmap_lookup_result cold_mmap_lookup(
@@ -1539,6 +1611,29 @@ static cold_mmap_lookup_result cold_mmap_lookup(
     cold_mmap_lookup_result result;
     result.order = store.order;
     if (store.data == nullptr || store.bytes <= 0 || store.order <= 0 || (int) history.size() < store.order) {
+        return result;
+    }
+
+    if (store.indexed) {
+        const char * records = store.data + 64;
+        uint64_t lo = 0;
+        uint64_t hi = store.record_count;
+        result.bytes_touched = 64;
+        while (lo < hi) {
+            const uint64_t mid = lo + (hi - lo) / 2;
+            const char * record = records + mid * store.record_size;
+            result.bytes_touched += (int64_t) store.record_size;
+            const int cmp = compare_cold_index_record(record, history, store.order);
+            if (cmp == 0) {
+                result.hit = true;
+                return result;
+            }
+            if (cmp < 0) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
         return result;
     }
 
@@ -1694,12 +1789,16 @@ static void trace_step(
           << "\"source_truncation_reason\":"
           << (source_truncated_by_draft_limit ? "\"ngplus_draft_limit\"" : "null") << ","
           << "\"cold_source\":\""
-          << (ngp.cold_store_enabled ? (ngp.cold_store_loaded ? "mmap-jsonl" : "mmap-unloaded") : "disabled") << "\","
+          << (ngp.cold_store_enabled ?
+                  (ngp.cold_store_loaded ? (ngp.cold_store_indexed ? "mmap-index" : "mmap-jsonl") : "mmap-unloaded") :
+                  "disabled") << "\","
           << "\"cold_path\":\"" << json_escape(ngp.cold_path) << "\","
           << "\"cold_mmap\":\"" << json_escape(ngp.cold_mmap) << "\","
           << "\"cold_store_enabled\":" << (ngp.cold_store_enabled ? "true" : "false") << ","
+          << "\"cold_store_indexed\":" << (ngp.cold_store_indexed ? "true" : "false") << ","
           << "\"cold_store_loaded\":" << (ngp.cold_store_loaded ? "true" : "false") << ","
           << "\"cold_store_order\":" << ngp.cold_store_order << ","
+          << "\"cold_store_records\":" << ngp.cold_store_records << ","
           << "\"cold_store_bytes\":" << ngp.cold_store_bytes << ","
           << "\"cold_store_load_us\":" << ngp.cold_store_load_us << ","
           << "\"cold_store_hit\":" << (cold_lookup.hit ? "true" : "false") << ","
@@ -1983,13 +2082,16 @@ int main(int argc, char ** argv) {
     const int64_t t_cold_init_start_us = ggml_time_us();
     try {
         if (ngp.cold_store_enabled && parse_on_off(ngp.cold_mmap, "--ngplus-cold-mmap") && !ngp.cold_path.empty()) {
-            cold_store = load_cold_mmap_store(ngp.cold_path);
+            cold_store = load_cold_mmap_store(ngp.cold_path, ngp.cold_store_indexed);
             ngp.cold_store_loaded = cold_store.data != nullptr && cold_store.bytes > 0;
             ngp.cold_store_order = cold_store.order;
+            ngp.cold_store_records = (int64_t) cold_store.record_count;
             ngp.cold_store_bytes = cold_store.bytes;
             LOG_INF(
-                "ngplus: mmap cold store order=%d bytes=%lld from %s\n",
+                "ngplus: mmap cold store source=%s order=%d records=%lld bytes=%lld from %s\n",
+                cold_store.indexed ? "index" : "jsonl",
                 ngp.cold_store_order,
+                (long long) ngp.cold_store_records,
                 (long long) ngp.cold_store_bytes,
                 ngp.cold_path.c_str());
         }
