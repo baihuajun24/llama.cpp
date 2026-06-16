@@ -83,6 +83,7 @@ struct ngplus_params {
     int fallback_steps = 0;
     bool static_hot_table_loaded = false;
     bool static_hot_table_candidate_enabled = false;
+    bool external_candidates_skip_step0 = false;
     int static_hot_table_candidate_min_count = 2;
     int static_hot_table_candidate_min_top_share_pct = 50;
     int static_hot_table_order = 0;
@@ -211,6 +212,7 @@ static void print_ngplus_usage(int, char **) {
     printf("\n----- ngplus verifier params -----\n\n");
     printf("  --ngplus-hot-source SOURCES   comma-separated hot sources (default: prompt,hot-table)\n");
     printf("                                include hot-table-candidates to enable guarded static table drafts\n");
+    printf("                                include skip-external-step0 to block external drafts at decode step 0\n");
     printf("                                include cold-store to enable read-only mmap cold lookup accounting\n");
     printf("                                include cold-store-indexed to mmap the .coldidx lookup sidecar\n");
     printf("                                include cold-store-candidates to draft from indexed cold hits\n");
@@ -444,6 +446,9 @@ static void normalize_phase4_source_args(ngplus_params & ngp) {
         ngp.cold_store_enabled = true;
         ngp.cold_store_indexed = true;
         ngp.cold_store_candidate_enabled = true;
+    }
+    if (has_csv_token(ngp.hot_source, "skip-external-step0")) {
+        ngp.external_candidates_skip_step0 = true;
     }
     if (ngp.hot_table_path.empty() && !ngp.cold_path.empty() && ends_with(ngp.cold_path, ".jsonl")) {
         ngp.hot_table_path = ngp.cold_path;
@@ -1868,6 +1873,9 @@ static void trace_step(
           << "\"static_hot_table_loaded\":" << (ngp.static_hot_table_loaded ? "true" : "false") << ","
           << "\"static_hot_table_path\":\"" << json_escape(ngp.hot_table_path) << "\","
           << "\"static_hot_table_candidate_enabled\":" << (ngp.static_hot_table_candidate_enabled ? "true" : "false") << ","
+          << "\"external_candidates_skip_step0\":" << (ngp.external_candidates_skip_step0 ? "true" : "false") << ","
+          << "\"external_candidates_blocked_step0\":"
+          << (ngp.external_candidates_skip_step0 && step == 0 ? "true" : "false") << ","
           << "\"static_hot_table_candidate_min_count\":" << ngp.static_hot_table_candidate_min_count << ","
           << "\"static_hot_table_candidate_min_top_share_pct\":" << ngp.static_hot_table_candidate_min_top_share_pct << ","
           << "\"static_hot_table_order\":" << ngp.static_hot_table_order << ","
@@ -2288,10 +2296,17 @@ int main(int argc, char ** argv) {
         ngp.cold_store_lookup_us_total += cold_lookup.lookup_us;
         ngp.cold_store_bytes_touched_total += cold_lookup.bytes_touched;
 
-        if (draft_result.tokens.empty() && static_hot_table_candidate_allowed(hot_table_lookup, ngp)) {
+        const bool external_candidates_allowed_this_step =
+            !(ngp.external_candidates_skip_step0 && step == 0);
+
+        if (draft_result.tokens.empty() &&
+                external_candidates_allowed_this_step &&
+                static_hot_table_candidate_allowed(hot_table_lookup, ngp)) {
             draft_result = static_hot_table_draft(hot_table_lookup, ngp, draft_limit);
         }
-        if (draft_result.tokens.empty() && cold_store_candidate_allowed(cold_lookup, ngp)) {
+        if (draft_result.tokens.empty() &&
+                external_candidates_allowed_this_step &&
+                cold_store_candidate_allowed(cold_lookup, ngp)) {
             draft_result = cold_store_draft(cold_lookup, ngp, draft_limit);
         }
 
