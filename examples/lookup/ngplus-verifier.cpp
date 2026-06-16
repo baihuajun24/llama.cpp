@@ -82,6 +82,7 @@ struct ngplus_params {
     int batched_verify_max_k = 0;                  // Phase 5: cap verified batch length (0 = no cap)
     bool hot_table_chain_enabled = false;         // Phase 5: chained multi-token code-store drafts
     bool structure_indent_enabled = false;        // Phase 5: model-free indentation drafter
+    bool hybrid_verify_enabled = false;           // Phase 5: blind for prompt echoes, correct for novel
     int static_hot_table_candidate_min_count = 2;
     int static_hot_table_candidate_min_top_share_pct = 50;
     int static_hot_table_order = 0;
@@ -384,6 +385,9 @@ static void normalize_phase4_source_args(ngplus_params & ngp) {
     }
     if (has_csv_token(ngp.hot_source, "structure-indent")) {
         ngp.structure_indent_enabled = true;
+    }
+    if (has_csv_token(ngp.hot_source, "hybrid-verify")) {
+        ngp.hybrid_verify_enabled = true;
     }
     // optional cap token "bv-k<N>" e.g. bv-k4 caps the correct verification batch length
     {
@@ -2163,7 +2167,7 @@ int main(int argc, char ** argv) {
             !ngp.reference_token_ids.empty() ||
             ngp.stop_after_reference_mismatch;
         const bool use_trusted_order4_suffix =
-            !ngp.batched_verify_enabled &&
+            (!ngp.batched_verify_enabled || ngp.hybrid_verify_enabled) &&
             draft_source == "prompt-local-hot" &&
             draft_result.order >= 4 &&
             draft.size() > 1 &&
@@ -2174,12 +2178,17 @@ int main(int argc, char ** argv) {
         // emitted token equals the target argmax (temp=0) so output matches AR exactly (unlike the
         // blind trusted path), while an accepted run still collapses into ~one forward pass.
         const bool use_batched_verify =
-            ngp.batched_verify_enabled &&
+            (ngp.batched_verify_enabled || ngp.hybrid_verify_enabled) &&
             draft.size() > 1 &&
-            ((draft_source == "prompt-local-hot" && draft_result.order >= 4) ||
-             draft_source == "recent-generation-hot" ||
-             draft_source == "static-hot-table") &&
-            !trace_step_diagnostics;
+            !trace_step_diagnostics &&
+            (ngp.hybrid_verify_enabled
+                // hybrid: blind-trust verbatim prompt echoes, correct-verify only novel sources
+                ? (draft_source == "recent-generation-hot" ||
+                   draft_source == "static-hot-table" ||
+                   draft_source == "structure-indent")
+                : ((draft_source == "prompt-local-hot" && draft_result.order >= 4) ||
+                   draft_source == "recent-generation-hot" ||
+                   draft_source == "static-hot-table"));
 
         const auto decode_next_token = [&](llama_token token) -> bool {
             const bool need_next_logits =
