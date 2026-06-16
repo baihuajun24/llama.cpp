@@ -77,7 +77,7 @@ struct ngplus_params {
     bool static_hot_table_loaded = false;
     bool static_hot_table_candidate_enabled = false;
     int static_hot_table_candidate_min_count = 2;
-    int static_hot_table_candidate_min_top_share_pct = 100;
+    int static_hot_table_candidate_min_top_share_pct = 50;
     int static_hot_table_order = 0;
     int static_hot_table_rows = 0;
     int64_t static_hot_table_bytes = 0;
@@ -176,7 +176,7 @@ static void print_ngplus_usage(int, char **) {
     printf("  --ngplus-hot-table-min-count N\n");
     printf("                                minimum top-token count for static hot-table drafts (default: 2)\n");
     printf("  --ngplus-hot-table-min-top-share-pct N\n");
-    printf("                                minimum top-token share percentage for static hot-table drafts (default: 100)\n");
+    printf("                                minimum top-token share percentage for static hot-table drafts (default: 50)\n");
     printf("  --ngplus-hot-ngram-max N      maximum prompt-local hot n-gram order accepted by CLI (default: 6)\n");
     printf("  --ngplus-cold-path FNAME      cold-store path; .jsonl paths are also accepted as Phase 4 hot-table fixtures\n");
     printf("  --ngplus-cold-mmap on|off     cold mmap flag, currently traced as a no-op source\n");
