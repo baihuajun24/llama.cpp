@@ -25,6 +25,11 @@
 #include <string>
 #include <vector>
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 struct ngplus_params {
     std::string hot_source = "prompt,hot-table";
     std::string hot_table_path;
@@ -82,6 +87,15 @@ struct ngplus_params {
     int static_hot_table_rows = 0;
     int64_t static_hot_table_bytes = 0;
     int64_t static_hot_table_load_us = 0;
+    bool cold_store_enabled = false;
+    bool cold_store_loaded = false;
+    int cold_store_order = 0;
+    int64_t cold_store_bytes = 0;
+    int64_t cold_store_load_us = 0;
+    int cold_store_hits = 0;
+    int cold_store_misses = 0;
+    int64_t cold_store_lookup_us_total = 0;
+    int64_t cold_store_bytes_touched_total = 0;
     std::string prompt_fingerprint;
     std::string prompt_token_head_json = "[]";
     std::string prompt_token_tail_json = "[]";
@@ -132,6 +146,20 @@ struct static_hot_table {
     std::unordered_map<std::string, hot_table_entry> entries;
 };
 
+struct cold_mmap_store {
+    int fd = -1;
+    const char * data = nullptr;
+    int64_t bytes = 0;
+    int order = 0;
+};
+
+struct cold_mmap_lookup_result {
+    bool hit = false;
+    int order = 0;
+    int64_t lookup_us = 0;
+    int64_t bytes_touched = 0;
+};
+
 static std::string token_key(const llama_tokens & tokens) {
     std::ostringstream out;
     for (size_t i = 0; i < tokens.size(); ++i) {
@@ -170,6 +198,7 @@ static void print_ngplus_usage(int, char **) {
     printf("\n----- ngplus verifier params -----\n\n");
     printf("  --ngplus-hot-source SOURCES   comma-separated hot sources (default: prompt,hot-table)\n");
     printf("                                include hot-table-candidates to enable guarded static table drafts\n");
+    printf("                                include cold-store to enable read-only mmap cold lookup accounting\n");
     printf("  --ngplus-hot-table-path FNAME load a Phase 4 static hot-table JSONL source for trace accounting\n");
     printf("  --ngplus-hot-table-candidates on|off\n");
     printf("                                allow high-confidence static hot-table one-token drafts (default: off)\n");
@@ -179,7 +208,7 @@ static void print_ngplus_usage(int, char **) {
     printf("                                minimum top-token share percentage for static hot-table drafts (default: 50)\n");
     printf("  --ngplus-hot-ngram-max N      maximum prompt-local hot n-gram order accepted by CLI (default: 6)\n");
     printf("  --ngplus-cold-path FNAME      cold-store path; .jsonl paths are also accepted as Phase 4 hot-table fixtures\n");
-    printf("  --ngplus-cold-mmap on|off     cold mmap flag, currently traced as a no-op source\n");
+    printf("  --ngplus-cold-mmap on|off     mmap --ngplus-cold-path for cold-store lookup accounting (default: on)\n");
     printf("  --ngplus-draft N              maximum prompt-local draft continuation length (default: 8)\n");
     printf("  --ngplus-tree-budget N        maximum verifier tree budget for this narrow verifier (default: 64)\n");
     printf("  --ngplus-trace FNAME          write per-step NG+ JSONL trace rows\n");
@@ -365,6 +394,10 @@ static void normalize_phase4_source_args(ngplus_params & ngp) {
     if (has_csv_token(ngp.hot_source, "hot-table-candidates") ||
             has_csv_token(ngp.hot_source, "static-hot-table-candidates")) {
         ngp.static_hot_table_candidate_enabled = true;
+    }
+    if (has_csv_token(ngp.hot_source, "cold-store") ||
+            has_csv_token(ngp.hot_source, "mmap-cold-store")) {
+        ngp.cold_store_enabled = true;
     }
     if (ngp.hot_table_path.empty() && !ngp.cold_path.empty() && ends_with(ngp.cold_path, ".jsonl")) {
         ngp.hot_table_path = ngp.cold_path;
@@ -1426,6 +1459,99 @@ static hot_table_lookup_result static_hot_table_lookup(
     return result;
 }
 
+static int infer_jsonl_context_order(const char * data, int64_t bytes) {
+    if (data == nullptr || bytes <= 0) {
+        return 0;
+    }
+    const char * begin = data;
+    const char * end = data + bytes;
+    const std::string prefix = "\"context\":[";
+    const auto ctx = std::search(begin, end, prefix.begin(), prefix.end());
+    if (ctx == end) {
+        return 0;
+    }
+    const char * cursor = ctx + prefix.size();
+    const char * close = std::find(cursor, end, ']');
+    if (close == end || close == cursor) {
+        return 0;
+    }
+    int order = 1;
+    for (const char * p = cursor; p < close; ++p) {
+        if (*p == ',') {
+            ++order;
+        }
+    }
+    return order;
+}
+
+static cold_mmap_store load_cold_mmap_store(const std::string & path) {
+    cold_mmap_store store;
+    if (path.empty()) {
+        return store;
+    }
+
+    store.fd = open(path.c_str(), O_RDONLY);
+    if (store.fd < 0) {
+        throw std::invalid_argument("failed to open --ngplus-cold-path for mmap: " + path);
+    }
+
+    struct stat st;
+    if (fstat(store.fd, &st) != 0) {
+        close(store.fd);
+        store.fd = -1;
+        throw std::invalid_argument("failed to stat --ngplus-cold-path for mmap: " + path);
+    }
+    if (st.st_size <= 0) {
+        close(store.fd);
+        store.fd = -1;
+        throw std::invalid_argument("--ngplus-cold-path is empty: " + path);
+    }
+
+    void * mapped = mmap(nullptr, (size_t) st.st_size, PROT_READ, MAP_PRIVATE, store.fd, 0);
+    if (mapped == MAP_FAILED) {
+        close(store.fd);
+        store.fd = -1;
+        throw std::invalid_argument("failed to mmap --ngplus-cold-path: " + path);
+    }
+
+    store.data = static_cast<const char *>(mapped);
+    store.bytes = (int64_t) st.st_size;
+    store.order = infer_jsonl_context_order(store.data, store.bytes);
+    return store;
+}
+
+static void close_cold_mmap_store(cold_mmap_store & store) {
+    if (store.data != nullptr && store.bytes > 0) {
+        munmap(const_cast<char *>(store.data), (size_t) store.bytes);
+    }
+    if (store.fd >= 0) {
+        close(store.fd);
+    }
+    store.data = nullptr;
+    store.fd = -1;
+    store.bytes = 0;
+    store.order = 0;
+}
+
+static cold_mmap_lookup_result cold_mmap_lookup(
+        const cold_mmap_store & store,
+        const std::vector<llama_token> & history) {
+    cold_mmap_lookup_result result;
+    result.order = store.order;
+    if (store.data == nullptr || store.bytes <= 0 || store.order <= 0 || (int) history.size() < store.order) {
+        return result;
+    }
+
+    const std::string key = token_key_suffix(history, store.order);
+    const std::string needle = "\"context\":[" + key + "]";
+    const char * begin = store.data;
+    const char * end = store.data + store.bytes;
+    const auto found = std::search(begin, end, needle.begin(), needle.end());
+    result.hit = found != end;
+    result.bytes_touched = result.hit ? (int64_t) ((found - begin) + needle.size()) : store.bytes;
+    return result;
+}
+
 static bool static_hot_table_candidate_allowed(
         const hot_table_lookup_result & lookup,
         const ngplus_params & ngp) {
@@ -1471,6 +1597,7 @@ static void trace_step(
         int source_continuation_copied,
         bool source_truncated_by_draft_limit,
         const hot_table_lookup_result & hot_table_lookup,
+        const cold_mmap_lookup_result & cold_lookup,
         int64_t hot_lookup_us,
         int64_t tree_build_us,
         int64_t target_verify_us,
@@ -1522,9 +1649,6 @@ static void trace_step(
           << "\"step\":" << step << ","
           << "\"source\":\"" << json_escape(draft_source) << "\","
           << "\"hot_source\":\"" << json_escape(ngp.hot_source) << "\","
-          << "\"cold_source\":\"noop\","
-          << "\"cold_path\":\"" << json_escape(ngp.cold_path) << "\","
-          << "\"cold_mmap\":\"" << json_escape(ngp.cold_mmap) << "\","
           << "\"prompt_format\":\"" << (ngp.chat_template_applied ? "chat-single-turn" : "raw") << "\","
           << "\"prompt_tokens\":" << ngp.prompt_tokens << ","
           << "\"prompt_bytes\":" << ngp.prompt_bytes << ","
@@ -1569,6 +1693,23 @@ static void trace_step(
           << "\"source_truncated_by_draft_limit\":" << (source_truncated_by_draft_limit ? "true" : "false") << ","
           << "\"source_truncation_reason\":"
           << (source_truncated_by_draft_limit ? "\"ngplus_draft_limit\"" : "null") << ","
+          << "\"cold_source\":\""
+          << (ngp.cold_store_enabled ? (ngp.cold_store_loaded ? "mmap-jsonl" : "mmap-unloaded") : "disabled") << "\","
+          << "\"cold_path\":\"" << json_escape(ngp.cold_path) << "\","
+          << "\"cold_mmap\":\"" << json_escape(ngp.cold_mmap) << "\","
+          << "\"cold_store_enabled\":" << (ngp.cold_store_enabled ? "true" : "false") << ","
+          << "\"cold_store_loaded\":" << (ngp.cold_store_loaded ? "true" : "false") << ","
+          << "\"cold_store_order\":" << ngp.cold_store_order << ","
+          << "\"cold_store_bytes\":" << ngp.cold_store_bytes << ","
+          << "\"cold_store_load_us\":" << ngp.cold_store_load_us << ","
+          << "\"cold_store_hit\":" << (cold_lookup.hit ? "true" : "false") << ","
+          << "\"cold_store_lookup_order\":" << cold_lookup.order << ","
+          << "\"cold_store_lookup_us\":" << cold_lookup.lookup_us << ","
+          << "\"cold_store_bytes_touched\":" << cold_lookup.bytes_touched << ","
+          << "\"cold_store_hits_total\":" << ngp.cold_store_hits << ","
+          << "\"cold_store_misses_total\":" << ngp.cold_store_misses << ","
+          << "\"cold_store_lookup_us_total\":" << ngp.cold_store_lookup_us_total << ","
+          << "\"cold_store_bytes_touched_total\":" << ngp.cold_store_bytes_touched_total << ","
           << "\"static_hot_table_loaded\":" << (ngp.static_hot_table_loaded ? "true" : "false") << ","
           << "\"static_hot_table_path\":\"" << json_escape(ngp.hot_table_path) << "\","
           << "\"static_hot_table_candidate_enabled\":" << (ngp.static_hot_table_candidate_enabled ? "true" : "false") << ","
@@ -1603,7 +1744,7 @@ static void trace_step(
           << "\"fallback\":" << (drafted_tokens > 0 ? "false" : "true") << ","
           << "\"fallback_reason\":" << (drafted_tokens > 0 ? "null" : "\"no_prompt_local_candidate\"") << ","
           << "\"hot_lookup_us\":" << hot_lookup_us << ","
-          << "\"cold_lookup_us\":0,"
+          << "\"cold_lookup_us\":" << cold_lookup.lookup_us << ","
           << "\"tree_build_us\":" << tree_build_us << ","
           << "\"target_verify_us\":" << target_verify_us << ","
           << "\"kv_cleanup_us\":" << kv_cleanup_us << ","
@@ -1838,10 +1979,33 @@ int main(int argc, char ** argv) {
     const int64_t t_hot_init_us = ggml_time_us() - t_hot_init_start_us;
     ngp.static_hot_table_load_us = t_hot_init_us;
 
+    cold_mmap_store cold_store;
+    const int64_t t_cold_init_start_us = ggml_time_us();
+    try {
+        if (ngp.cold_store_enabled && parse_on_off(ngp.cold_mmap, "--ngplus-cold-mmap") && !ngp.cold_path.empty()) {
+            cold_store = load_cold_mmap_store(ngp.cold_path);
+            ngp.cold_store_loaded = cold_store.data != nullptr && cold_store.bytes > 0;
+            ngp.cold_store_order = cold_store.order;
+            ngp.cold_store_bytes = cold_store.bytes;
+            LOG_INF(
+                "ngplus: mmap cold store order=%d bytes=%lld from %s\n",
+                ngp.cold_store_order,
+                (long long) ngp.cold_store_bytes,
+                ngp.cold_path.c_str());
+        }
+    } catch (const std::exception & e) {
+        LOG_ERR("%s\n", e.what());
+        close_cold_mmap_store(cold_store);
+        llama_backend_free();
+        return 1;
+    }
+    ngp.cold_store_load_us = ggml_time_us() - t_cold_init_start_us;
+
     const int max_context_size = llama_n_ctx(ctx);
     const int max_tokens_list_size = max_context_size - 4;
     if ((int) history.size() > max_tokens_list_size) {
         LOG_ERR("%s: prompt too long (%d tokens, max %d)\n", __func__, (int) history.size(), max_tokens_list_size);
+        close_cold_mmap_store(cold_store);
         llama_backend_free();
         return 1;
     }
@@ -1866,6 +2030,7 @@ int main(int argc, char ** argv) {
         trace.open(ngp.trace_path);
         if (!trace.is_open()) {
             LOG_ERR("failed to open NG+ trace file: %s\n", ngp.trace_path.c_str());
+            close_cold_mmap_store(cold_store);
             llama_backend_free();
             return 1;
         }
@@ -1901,6 +2066,7 @@ int main(int argc, char ** argv) {
     }
     if (llama_decode(ctx, batch_tgt) != 0) {
         LOG_ERR("failed to evaluate full prompt for server-aligned NG+ verification\n");
+        close_cold_mmap_store(cold_store);
         common_sampler_free(smpl);
         llama_batch_free(batch_tgt);
         llama_backend_free();
@@ -1948,6 +2114,20 @@ int main(int argc, char ** argv) {
         }
         hot_table_lookup.lookup_us = ggml_time_us() - t_static_hot_lookup_start_us;
         ngp.static_hot_table_lookup_us_total += hot_table_lookup.lookup_us;
+
+        cold_mmap_lookup_result cold_lookup;
+        const int64_t t_cold_lookup_start_us = ggml_time_us();
+        if (ngp.cold_store_loaded) {
+            cold_lookup = cold_mmap_lookup(cold_store, history);
+            if (cold_lookup.hit) {
+                ++ngp.cold_store_hits;
+            } else {
+                ++ngp.cold_store_misses;
+            }
+        }
+        cold_lookup.lookup_us = ggml_time_us() - t_cold_lookup_start_us;
+        ngp.cold_store_lookup_us_total += cold_lookup.lookup_us;
+        ngp.cold_store_bytes_touched_total += cold_lookup.bytes_touched;
 
         if (draft_result.tokens.empty() && static_hot_table_candidate_allowed(hot_table_lookup, ngp)) {
             draft_result = static_hot_table_draft(hot_table_lookup, ngp, draft_limit);
@@ -2190,6 +2370,7 @@ int main(int argc, char ** argv) {
             draft_result.continuation_copied,
             draft_result.truncated_by_draft_limit,
             hot_table_lookup,
+            cold_lookup,
             draft_us + hot_table_lookup.lookup_us,
             draft_us,
             verify_us,
@@ -2259,6 +2440,8 @@ int main(int argc, char ** argv) {
     LOG_INF("n_drafted    = %d\n", n_drafted);
     LOG_INF("n_drafted_prompt_local = %d\n", ngp.prompt_local_drafted_tokens);
     LOG_INF("n_drafted_recent_gen   = %d\n", ngp.recent_generation_drafted_tokens);
+    LOG_INF("cold_store_hits        = %d\n", ngp.cold_store_hits);
+    LOG_INF("cold_store_misses      = %d\n", ngp.cold_store_misses);
     LOG_INF("fallback_steps         = %d\n", ngp.fallback_steps);
     LOG_INF("n_accept     = %d\n", n_accept);
     LOG_INF("accept       = %.3f%%\n", n_drafted > 0 ? 100.0f * n_accept / n_drafted : 0.0f);
@@ -2277,6 +2460,7 @@ int main(int argc, char ** argv) {
 
     common_sampler_free(smpl);
     llama_batch_free(batch_tgt);
+    close_cold_mmap_store(cold_store);
     llama_backend_free();
     LOG("\n\n");
 
