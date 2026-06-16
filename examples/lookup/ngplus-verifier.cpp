@@ -80,6 +80,7 @@ struct ngplus_params {
     int recent_generation_min_order = 4;          // Phase 5: min suffix order for self-ref drafts
     bool batched_verify_enabled = false;          // Phase 5: correct batched spec verify (vs blind)
     int batched_verify_max_k = 0;                  // Phase 5: cap verified batch length (0 = no cap)
+    bool hot_table_chain_enabled = false;         // Phase 5: chained multi-token code-store drafts
     int static_hot_table_candidate_min_count = 2;
     int static_hot_table_candidate_min_top_share_pct = 50;
     int static_hot_table_order = 0;
@@ -376,6 +377,9 @@ static void normalize_phase4_source_args(ngplus_params & ngp) {
     }
     if (has_csv_token(ngp.hot_source, "batched-verify")) {
         ngp.batched_verify_enabled = true;
+    }
+    if (has_csv_token(ngp.hot_source, "hot-table-chain")) {
+        ngp.hot_table_chain_enabled = true;
     }
     // optional cap token "bv-k<N>" e.g. bv-k4 caps the correct verification batch length
     {
@@ -1549,6 +1553,39 @@ static prompt_draft_result static_hot_table_draft(
     return result;
 }
 
+// Phase 5 high-leap (iter6, primary thrust): code-distribution multi-token chained store draft.
+// Instead of one top token, follow the store chain: emit the gated top token, shift the order-N
+// context by one, look up again, repeat up to draft_limit. Produces *chained* multi-token
+// continuations from a disjoint code corpus for body steps. Verified per-token (or via batched
+// verify when enabled); never blind-trusted.
+static prompt_draft_result static_hot_table_chain_draft(
+        const static_hot_table & table,
+        const ngplus_params & ngp,
+        std::vector<llama_token> history,
+        int draft_limit) {
+    prompt_draft_result result;
+    if (draft_limit <= 0 || table.order <= 0) {
+        return result;
+    }
+    for (int n = 0; n < draft_limit; ++n) {
+        hot_table_lookup_result lk = static_hot_table_lookup(table, history);
+        if (!static_hot_table_candidate_allowed(lk, ngp)) {
+            break;
+        }
+        result.tokens.push_back(lk.top_token);
+        history.push_back(lk.top_token);
+    }
+    if (!result.tokens.empty()) {
+        result.order = table.order;
+        result.source_pos = -1;
+        result.continuation_start = -1;
+        result.continuation_available = (int) result.tokens.size();
+        result.continuation_copied = (int) result.tokens.size();
+        result.source_label = "static-hot-table";
+    }
+    return result;
+}
+
 static void trace_step(
         std::ofstream & trace,
         int step,
@@ -2042,7 +2079,9 @@ int main(int argc, char ** argv) {
         ngp.static_hot_table_lookup_us_total += hot_table_lookup.lookup_us;
 
         if (draft_result.tokens.empty() && static_hot_table_candidate_allowed(hot_table_lookup, ngp)) {
-            draft_result = static_hot_table_draft(hot_table_lookup, ngp, draft_limit);
+            draft_result = ngp.hot_table_chain_enabled
+                ? static_hot_table_chain_draft(hot_table, ngp, history, draft_limit)
+                : static_hot_table_draft(hot_table_lookup, ngp, draft_limit);
         }
 
         if (draft_result.tokens.empty() && ngp.recent_generation_enabled) {
