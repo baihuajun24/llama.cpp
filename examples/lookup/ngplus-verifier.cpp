@@ -169,6 +169,7 @@ static std::string draft_source_label(const prompt_draft_result & draft_result, 
 static void print_ngplus_usage(int, char **) {
     printf("\n----- ngplus verifier params -----\n\n");
     printf("  --ngplus-hot-source SOURCES   comma-separated hot sources (default: prompt,hot-table)\n");
+    printf("                                include hot-table-candidates to enable guarded static table drafts\n");
     printf("  --ngplus-hot-table-path FNAME load a Phase 4 static hot-table JSONL source for trace accounting\n");
     printf("  --ngplus-hot-table-candidates on|off\n");
     printf("                                allow high-confidence static hot-table one-token drafts (default: off)\n");
@@ -177,7 +178,7 @@ static void print_ngplus_usage(int, char **) {
     printf("  --ngplus-hot-table-min-top-share-pct N\n");
     printf("                                minimum top-token share percentage for static hot-table drafts (default: 100)\n");
     printf("  --ngplus-hot-ngram-max N      maximum prompt-local hot n-gram order accepted by CLI (default: 6)\n");
-    printf("  --ngplus-cold-path FNAME      cold-store path, currently traced as a no-op source\n");
+    printf("  --ngplus-cold-path FNAME      cold-store path; .jsonl paths are also accepted as Phase 4 hot-table fixtures\n");
     printf("  --ngplus-cold-mmap on|off     cold mmap flag, currently traced as a no-op source\n");
     printf("  --ngplus-draft N              maximum prompt-local draft continuation length (default: 8)\n");
     printf("  --ngplus-tree-budget N        maximum verifier tree budget for this narrow verifier (default: 64)\n");
@@ -244,6 +245,36 @@ static bool parse_on_off(const std::string & value, const std::string & arg) {
         return false;
     }
     throw std::invalid_argument("invalid on/off value for " + arg + ": " + value);
+}
+
+static bool has_csv_token(const std::string & csv, const std::string & token) {
+    size_t begin = 0;
+    while (begin <= csv.size()) {
+        size_t end = csv.find(',', begin);
+        if (end == std::string::npos) {
+            end = csv.size();
+        }
+        std::string item = csv.substr(begin, end - begin);
+        item.erase(item.begin(), std::find_if(item.begin(), item.end(), [](unsigned char ch) {
+            return !std::isspace(ch);
+        }));
+        item.erase(std::find_if(item.rbegin(), item.rend(), [](unsigned char ch) {
+            return !std::isspace(ch);
+        }).base(), item.end());
+        if (item == token) {
+            return true;
+        }
+        if (end == csv.size()) {
+            break;
+        }
+        begin = end + 1;
+    }
+    return false;
+}
+
+static bool ends_with(const std::string & value, const std::string & suffix) {
+    return value.size() >= suffix.size() &&
+        value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
 #ifdef NGPLUS_USE_UPSTREAM_GEMMA4
@@ -328,6 +359,16 @@ static std::string resolve_hf_repo_to_local_model(const std::string & repo) {
         }
     }
     return "";
+}
+
+static void normalize_phase4_source_args(ngplus_params & ngp) {
+    if (has_csv_token(ngp.hot_source, "hot-table-candidates") ||
+            has_csv_token(ngp.hot_source, "static-hot-table-candidates")) {
+        ngp.static_hot_table_candidate_enabled = true;
+    }
+    if (ngp.hot_table_path.empty() && !ngp.cold_path.empty() && ends_with(ngp.cold_path, ".jsonl")) {
+        ngp.hot_table_path = ngp.cold_path;
+    }
 }
 
 static std::vector<std::string> preprocess_args(int argc, char ** argv, ngplus_params & ngp) {
@@ -458,6 +499,8 @@ static std::vector<std::string> preprocess_args(int argc, char ** argv, ngplus_p
             out.emplace_back(arg);
         }
     }
+
+    normalize_phase4_source_args(ngp);
 
 #ifdef NGPLUS_USE_UPSTREAM_GEMMA4
     if (force_cpu && !wrote_cpu_device) {
