@@ -78,6 +78,7 @@ struct ngplus_params {
     bool static_hot_table_candidate_enabled = false;
     bool recent_generation_enabled = false;       // Phase 5: self-referential generation cache
     int recent_generation_min_order = 4;          // Phase 5: min suffix order for self-ref drafts
+    bool batched_verify_enabled = false;          // Phase 5: correct batched spec verify (vs blind)
     int static_hot_table_candidate_min_count = 2;
     int static_hot_table_candidate_min_top_share_pct = 50;
     int static_hot_table_order = 0;
@@ -371,6 +372,9 @@ static void normalize_phase4_source_args(ngplus_params & ngp) {
     if (has_csv_token(ngp.hot_source, "recent-generation") ||
             has_csv_token(ngp.hot_source, "self-ref")) {
         ngp.recent_generation_enabled = true;
+    }
+    if (has_csv_token(ngp.hot_source, "batched-verify")) {
+        ngp.batched_verify_enabled = true;
     }
     if (ngp.hot_table_path.empty() && !ngp.cold_path.empty() && ends_with(ngp.cold_path, ".jsonl")) {
         ngp.hot_table_path = ngp.cold_path;
@@ -2062,9 +2066,22 @@ int main(int argc, char ** argv) {
             !ngp.reference_token_ids.empty() ||
             ngp.stop_after_reference_mismatch;
         const bool use_trusted_order4_suffix =
+            !ngp.batched_verify_enabled &&
             draft_source == "prompt-local-hot" &&
             draft_result.order >= 4 &&
             draft.size() > 1 &&
+            !trace_step_diagnostics;
+        // Phase 5 high-leap (iter4): correct batched speculative verify. Applies to any multi-token
+        // draft from a high-confidence source. One batched decode with logits at EVERY position,
+        // accept the longest argmax-matching prefix, emit one bonus token, roll back KV. Every
+        // emitted token equals the target argmax (temp=0) so output matches AR exactly (unlike the
+        // blind trusted path), while an accepted run still collapses into ~one forward pass.
+        const bool use_batched_verify =
+            ngp.batched_verify_enabled &&
+            draft.size() > 1 &&
+            ((draft_source == "prompt-local-hot" && draft_result.order >= 4) ||
+             draft_source == "recent-generation-hot" ||
+             draft_source == "static-hot-table") &&
             !trace_step_diagnostics;
 
         const auto decode_next_token = [&](llama_token token) -> bool {
@@ -2163,6 +2180,57 @@ int main(int argc, char ** argv) {
             ++target_tokens_this_step;
 
             if (has_eos || (params.n_predict >= 0 && n_predict >= params.n_predict)) {
+                break;
+            }
+            if (accepted_current && i_dft == 0 && use_batched_verify) {
+                // draft[0] already emitted (== argmax of pre-decode logits). Batch-decode the full
+                // draft with logits at every position, then verify each successor against argmax.
+                const int n_past_base = n_past;
+                const int k = std::min((int) draft.size(), remaining);
+                common_batch_clear(batch_tgt);
+                for (int j = 0; j < k; ++j) {
+                    common_batch_add(batch_tgt, draft[j], n_past_base + j, { 0 }, true);
+                }
+                if (llama_decode(ctx, batch_tgt) != 0) {
+                    LOG_ERR("target batch decode failed during batched NG+ verify\n");
+                    decode_failed = true;
+                    break;
+                }
+                int accepted = 1; // draft[0]
+                llama_token bonus = -1;
+                for (int i = 0; i < k; ++i) {
+                    const llama_token cand = common_sampler_sample(smpl, ctx, i);
+                    if (i + 1 < k && cand == draft[i + 1]) {
+                        common_sampler_accept(smpl, draft[i + 1], true);
+                        emit_token(draft[i + 1]);
+                        ++accepted_from_draft;
+                        ++accepted;
+                        ++target_tokens_this_step;
+                        if (has_eos || (params.n_predict >= 0 && n_predict >= params.n_predict)) {
+                            bonus = -1;
+                            break;
+                        }
+                    } else {
+                        bonus = cand; // mismatch correction, or genuine next token after a full match
+                        break;
+                    }
+                }
+                // Keep only the accepted prefix in KV; discard the rejected draft tail.
+                n_past = n_past_base + accepted;
+#ifdef NGPLUS_USE_UPSTREAM_GEMMA4
+                llama_memory_seq_rm(llama_get_memory(ctx), 0, n_past, -1);
+#else
+                llama_kv_self_seq_rm(ctx, 0, n_past, -1);
+#endif
+                if (bonus >= 0 && !has_eos && (params.n_predict < 0 || n_predict < params.n_predict)) {
+                    common_sampler_accept(smpl, bonus, true);
+                    emit_token(bonus);
+                    ++target_tokens_this_step;
+                    if (!decode_next_token(bonus)) {
+                        decode_failed = true;
+                        break;
+                    }
+                }
                 break;
             }
             if (accepted_current && i_dft == 0 && use_trusted_order4_suffix) {
