@@ -76,6 +76,8 @@ struct ngplus_params {
     int fallback_steps = 0;
     bool static_hot_table_loaded = false;
     bool static_hot_table_candidate_enabled = false;
+    bool recent_generation_enabled = false;       // Phase 5: self-referential generation cache
+    int recent_generation_min_order = 4;          // Phase 5: min suffix order for self-ref drafts
     int static_hot_table_candidate_min_count = 2;
     int static_hot_table_candidate_min_top_share_pct = 50;
     int static_hot_table_order = 0;
@@ -365,6 +367,10 @@ static void normalize_phase4_source_args(ngplus_params & ngp) {
     if (has_csv_token(ngp.hot_source, "hot-table-candidates") ||
             has_csv_token(ngp.hot_source, "static-hot-table-candidates")) {
         ngp.static_hot_table_candidate_enabled = true;
+    }
+    if (has_csv_token(ngp.hot_source, "recent-generation") ||
+            has_csv_token(ngp.hot_source, "self-ref")) {
+        ngp.recent_generation_enabled = true;
     }
     if (ngp.hot_table_path.empty() && !ngp.cold_path.empty() && ends_with(ngp.cold_path, ".jsonl")) {
         ngp.hot_table_path = ngp.cold_path;
@@ -1260,6 +1266,71 @@ static prompt_draft_result prompt_local_draft(
     return result;
 }
 
+// Phase 5 high-leap (iter3): self-referential generation cache.
+// prompt_local_draft only drafts continuations that START inside the prompt
+// (continuation_start >= prompt_tokens -> skip). This drafts from the model's
+// OWN accepted output: search generated history for an earlier occurrence of the
+// current suffix and copy its continuation. Routed through the correct per-token
+// verify path (source_label "recent-generation-hot", never the blind trusted
+// suffix), so it cannot worsen AR-hash agreement. Targets no_draft_rows on novel
+// body code, where repeated identifiers/structures recur within one solution.
+static prompt_draft_result recent_generation_draft(
+        const std::vector<llama_token> & history,
+        int prompt_tokens,
+        int max_order,
+        int min_order,
+        int max_draft) {
+    prompt_draft_result result;
+    const int history_size = (int) history.size();
+    // require at least some generated tokens beyond the prompt
+    if (max_draft <= 0 || history_size <= prompt_tokens + min_order) {
+        return result;
+    }
+
+    const int order_max = std::min(max_order, history_size);
+    for (int order = order_max; order >= min_order; --order) {
+        const int key_start = history_size - order;
+        if (key_start <= 0) {
+            continue;
+        }
+        for (int pos = key_start - 1; pos >= 0; --pos) {
+            bool match = true;
+            for (int i = 0; i < order; ++i) {
+                if (history[pos + i] != history[key_start + i]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (!match) {
+                continue;
+            }
+            const int continuation_start = pos + order;
+            if (continuation_start >= key_start) {
+                continue; // overlapping match, no usable continuation
+            }
+            const int available = key_start - continuation_start;
+            const int n_copy = std::min(max_draft, available);
+            if (n_copy <= 0) {
+                continue;
+            }
+            result.tokens.insert(
+                result.tokens.end(),
+                history.begin() + continuation_start,
+                history.begin() + continuation_start + n_copy);
+            result.order = order;
+            result.source_pos = pos;
+            result.continuation_start = continuation_start;
+            result.continuation_available = available;
+            result.continuation_copied = n_copy;
+            result.truncated_by_draft_limit = n_copy < available;
+            result.source_label = "recent-generation-hot";
+            return result;
+        }
+    }
+
+    return result;
+}
+
 static int parse_int_field(const std::string & line, const std::string & key, int default_value) {
     const std::string needle = "\"" + key + "\":";
     const size_t pos = line.find(needle);
@@ -1951,6 +2022,12 @@ int main(int argc, char ** argv) {
 
         if (draft_result.tokens.empty() && static_hot_table_candidate_allowed(hot_table_lookup, ngp)) {
             draft_result = static_hot_table_draft(hot_table_lookup, ngp, draft_limit);
+        }
+
+        if (draft_result.tokens.empty() && ngp.recent_generation_enabled) {
+            draft_result = recent_generation_draft(
+                history, ngp.prompt_tokens, ngp.effective_ngram_max,
+                ngp.recent_generation_min_order, draft_limit);
         }
 
         const llama_tokens & draft = draft_result.tokens;
