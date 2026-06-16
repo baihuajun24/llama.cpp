@@ -1064,6 +1064,9 @@ static prompt_draft_result prompt_local_draft(
             if (order < 4) {
                 continue;
             }
+            if (order >= 4 && pos > 80) {
+                continue;
+            }
             if (order == 2 && pos > 11) {
                 continue;
             }
