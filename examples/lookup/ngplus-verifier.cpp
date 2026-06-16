@@ -1061,6 +1061,9 @@ static prompt_draft_result prompt_local_draft(
             if (continuation_start >= prompt_tokens) {
                 continue;
             }
+            if (order == 2 && pos > 11) {
+                continue;
+            }
             const int available = history_size - continuation_start;
             const int order_max_draft =
                 order >= trusted_order_min ? std::max(max_draft, trusted_max_draft) : max_draft;
