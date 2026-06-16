@@ -79,6 +79,7 @@ struct ngplus_params {
     bool recent_generation_enabled = false;       // Phase 5: self-referential generation cache
     int recent_generation_min_order = 4;          // Phase 5: min suffix order for self-ref drafts
     bool batched_verify_enabled = false;          // Phase 5: correct batched spec verify (vs blind)
+    int batched_verify_max_k = 0;                  // Phase 5: cap verified batch length (0 = no cap)
     int static_hot_table_candidate_min_count = 2;
     int static_hot_table_candidate_min_top_share_pct = 50;
     int static_hot_table_order = 0;
@@ -375,6 +376,22 @@ static void normalize_phase4_source_args(ngplus_params & ngp) {
     }
     if (has_csv_token(ngp.hot_source, "batched-verify")) {
         ngp.batched_verify_enabled = true;
+    }
+    // optional cap token "bv-k<N>" e.g. bv-k4 caps the correct verification batch length
+    {
+        std::stringstream ss(ngp.hot_source);
+        std::string tok;
+        while (std::getline(ss, tok, ',')) {
+            // trim spaces
+            size_t b = tok.find_first_not_of(" \t");
+            size_t e = tok.find_last_not_of(" \t");
+            if (b == std::string::npos) continue;
+            tok = tok.substr(b, e - b + 1);
+            if (tok.rfind("bv-k", 0) == 0) {
+                try { ngp.batched_verify_max_k = std::max(1, std::stoi(tok.substr(4))); }
+                catch (...) {}
+            }
+        }
     }
     if (ngp.hot_table_path.empty() && !ngp.cold_path.empty() && ends_with(ngp.cold_path, ".jsonl")) {
         ngp.hot_table_path = ngp.cold_path;
@@ -2186,7 +2203,10 @@ int main(int argc, char ** argv) {
                 // draft[0] already emitted (== argmax of pre-decode logits). Batch-decode the full
                 // draft with logits at every position, then verify each successor against argmax.
                 const int n_past_base = n_past;
-                const int k = std::min((int) draft.size(), remaining);
+                int k = std::min((int) draft.size(), remaining);
+                if (ngp.batched_verify_max_k > 0) {
+                    k = std::min(k, ngp.batched_verify_max_k);
+                }
                 common_batch_clear(batch_tgt);
                 for (int j = 0; j < k; ++j) {
                     common_batch_add(batch_tgt, draft[j], n_past_base + j, { 0 }, true);
