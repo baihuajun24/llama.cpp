@@ -84,6 +84,7 @@ struct ngplus_params {
     bool static_hot_table_loaded = false;
     bool static_hot_table_candidate_enabled = false;
     bool external_candidates_skip_step0 = false;
+    bool external_step0_typing_only = false;
     int static_hot_table_candidate_min_count = 2;
     int static_hot_table_candidate_min_top_share_pct = 50;
     int static_hot_table_order = 0;
@@ -208,11 +209,26 @@ static std::string draft_source_label(const prompt_draft_result & draft_result, 
     return "recent-generation-hot";
 }
 
+static bool prompt_has_typing_import(const ngplus_params & ngp) {
+    return ngp.prompt_text.find("from typing import") != std::string::npos;
+}
+
+static bool external_candidates_blocked_at_step(const ngplus_params & ngp, int step) {
+    if (step != 0) {
+        return false;
+    }
+    if (ngp.external_candidates_skip_step0) {
+        return true;
+    }
+    return ngp.external_step0_typing_only && !prompt_has_typing_import(ngp);
+}
+
 static void print_ngplus_usage(int, char **) {
     printf("\n----- ngplus verifier params -----\n\n");
     printf("  --ngplus-hot-source SOURCES   comma-separated hot sources (default: prompt,hot-table)\n");
     printf("                                include hot-table-candidates to enable guarded static table drafts\n");
     printf("                                include skip-external-step0 to block external drafts at decode step 0\n");
+    printf("                                include step0-external-typing-only to allow step0 external drafts only for typed prompts\n");
     printf("                                include cold-store to enable read-only mmap cold lookup accounting\n");
     printf("                                include cold-store-indexed to mmap the .coldidx lookup sidecar\n");
     printf("                                include cold-store-candidates to draft from indexed cold hits\n");
@@ -449,6 +465,10 @@ static void normalize_phase4_source_args(ngplus_params & ngp) {
     }
     if (has_csv_token(ngp.hot_source, "skip-external-step0")) {
         ngp.external_candidates_skip_step0 = true;
+    }
+    if (has_csv_token(ngp.hot_source, "step0-external-typing-only") ||
+            has_csv_token(ngp.hot_source, "external-step0-typing-only")) {
+        ngp.external_step0_typing_only = true;
     }
     if (ngp.hot_table_path.empty() && !ngp.cold_path.empty() && ends_with(ngp.cold_path, ".jsonl")) {
         ngp.hot_table_path = ngp.cold_path;
@@ -1874,8 +1894,11 @@ static void trace_step(
           << "\"static_hot_table_path\":\"" << json_escape(ngp.hot_table_path) << "\","
           << "\"static_hot_table_candidate_enabled\":" << (ngp.static_hot_table_candidate_enabled ? "true" : "false") << ","
           << "\"external_candidates_skip_step0\":" << (ngp.external_candidates_skip_step0 ? "true" : "false") << ","
+          << "\"external_step0_typing_only\":" << (ngp.external_step0_typing_only ? "true" : "false") << ","
+          << "\"external_step0_prompt_has_typing_import\":"
+          << (prompt_has_typing_import(ngp) ? "true" : "false") << ","
           << "\"external_candidates_blocked_step0\":"
-          << (ngp.external_candidates_skip_step0 && step == 0 ? "true" : "false") << ","
+          << (external_candidates_blocked_at_step(ngp, step) ? "true" : "false") << ","
           << "\"static_hot_table_candidate_min_count\":" << ngp.static_hot_table_candidate_min_count << ","
           << "\"static_hot_table_candidate_min_top_share_pct\":" << ngp.static_hot_table_candidate_min_top_share_pct << ","
           << "\"static_hot_table_order\":" << ngp.static_hot_table_order << ","
@@ -2297,7 +2320,7 @@ int main(int argc, char ** argv) {
         ngp.cold_store_bytes_touched_total += cold_lookup.bytes_touched;
 
         const bool external_candidates_allowed_this_step =
-            !(ngp.external_candidates_skip_step0 && step == 0);
+            !external_candidates_blocked_at_step(ngp, step);
 
         if (draft_result.tokens.empty() &&
                 external_candidates_allowed_this_step &&
