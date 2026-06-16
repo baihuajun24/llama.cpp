@@ -85,6 +85,7 @@ struct ngplus_params {
     bool static_hot_table_candidate_enabled = false;
     bool external_candidates_skip_step0 = false;
     bool external_step0_typing_only = false;
+    bool external_skip_after_code_fence = false;
     int static_hot_table_candidate_min_count = 2;
     int static_hot_table_candidate_min_top_share_pct = 50;
     int static_hot_table_order = 0;
@@ -213,7 +214,23 @@ static bool prompt_has_typing_import(const ngplus_params & ngp) {
     return ngp.prompt_text.find("from typing import") != std::string::npos;
 }
 
-static bool external_candidates_blocked_at_step(const ngplus_params & ngp, int step) {
+static bool history_ends_with_code_fence_preamble(const std::vector<llama_token> & history) {
+    static constexpr llama_token token_code_fence = 2717; // ```
+    static constexpr llama_token token_python = 6719;     // python
+    static constexpr llama_token token_newline = 107;     // \n
+    return history.size() >= 3 &&
+        history[history.size() - 3] == token_code_fence &&
+        history[history.size() - 2] == token_python &&
+        history[history.size() - 1] == token_newline;
+}
+
+static bool external_candidates_blocked_at_step(
+        const ngplus_params & ngp,
+        int step,
+        const std::vector<llama_token> & history) {
+    if (ngp.external_skip_after_code_fence && history_ends_with_code_fence_preamble(history)) {
+        return true;
+    }
     if (step != 0) {
         return false;
     }
@@ -229,6 +246,7 @@ static void print_ngplus_usage(int, char **) {
     printf("                                include hot-table-candidates to enable guarded static table drafts\n");
     printf("                                include skip-external-step0 to block external drafts at decode step 0\n");
     printf("                                include step0-external-typing-only to allow step0 external drafts only for typed prompts\n");
+    printf("                                include skip-external-after-code-fence to block code-body first-token external drafts\n");
     printf("                                include cold-store to enable read-only mmap cold lookup accounting\n");
     printf("                                include cold-store-indexed to mmap the .coldidx lookup sidecar\n");
     printf("                                include cold-store-candidates to draft from indexed cold hits\n");
@@ -469,6 +487,10 @@ static void normalize_phase4_source_args(ngplus_params & ngp) {
     if (has_csv_token(ngp.hot_source, "step0-external-typing-only") ||
             has_csv_token(ngp.hot_source, "external-step0-typing-only")) {
         ngp.external_step0_typing_only = true;
+    }
+    if (has_csv_token(ngp.hot_source, "skip-external-after-code-fence") ||
+            has_csv_token(ngp.hot_source, "block-external-after-code-fence")) {
+        ngp.external_skip_after_code_fence = true;
     }
     if (ngp.hot_table_path.empty() && !ngp.cold_path.empty() && ends_with(ngp.cold_path, ".jsonl")) {
         ngp.hot_table_path = ngp.cold_path;
@@ -1765,6 +1787,8 @@ static void trace_step(
         int source_continuation_available,
         int source_continuation_copied,
         bool source_truncated_by_draft_limit,
+        bool external_candidates_blocked,
+        bool external_candidates_blocked_after_code_fence,
         const hot_table_lookup_result & hot_table_lookup,
         const cold_mmap_lookup_result & cold_lookup,
         int64_t hot_lookup_us,
@@ -1895,10 +1919,15 @@ static void trace_step(
           << "\"static_hot_table_candidate_enabled\":" << (ngp.static_hot_table_candidate_enabled ? "true" : "false") << ","
           << "\"external_candidates_skip_step0\":" << (ngp.external_candidates_skip_step0 ? "true" : "false") << ","
           << "\"external_step0_typing_only\":" << (ngp.external_step0_typing_only ? "true" : "false") << ","
+          << "\"external_skip_after_code_fence\":" << (ngp.external_skip_after_code_fence ? "true" : "false") << ","
           << "\"external_step0_prompt_has_typing_import\":"
           << (prompt_has_typing_import(ngp) ? "true" : "false") << ","
+          << "\"external_candidates_blocked\":"
+          << (external_candidates_blocked ? "true" : "false") << ","
+          << "\"external_candidates_blocked_after_code_fence\":"
+          << (external_candidates_blocked_after_code_fence ? "true" : "false") << ","
           << "\"external_candidates_blocked_step0\":"
-          << (external_candidates_blocked_at_step(ngp, step) ? "true" : "false") << ","
+          << (external_candidates_blocked && step == 0 ? "true" : "false") << ","
           << "\"static_hot_table_candidate_min_count\":" << ngp.static_hot_table_candidate_min_count << ","
           << "\"static_hot_table_candidate_min_top_share_pct\":" << ngp.static_hot_table_candidate_min_top_share_pct << ","
           << "\"static_hot_table_order\":" << ngp.static_hot_table_order << ","
@@ -2319,8 +2348,12 @@ int main(int argc, char ** argv) {
         ngp.cold_store_lookup_us_total += cold_lookup.lookup_us;
         ngp.cold_store_bytes_touched_total += cold_lookup.bytes_touched;
 
+        const bool external_candidates_blocked =
+            external_candidates_blocked_at_step(ngp, step, history);
+        const bool external_candidates_blocked_after_code_fence =
+            ngp.external_skip_after_code_fence && history_ends_with_code_fence_preamble(history);
         const bool external_candidates_allowed_this_step =
-            !external_candidates_blocked_at_step(ngp, step);
+            !external_candidates_blocked;
 
         if (draft_result.tokens.empty() &&
                 external_candidates_allowed_this_step &&
@@ -2571,6 +2604,8 @@ int main(int argc, char ** argv) {
             draft_result.continuation_available,
             draft_result.continuation_copied,
             draft_result.truncated_by_draft_limit,
+            external_candidates_blocked,
+            external_candidates_blocked_after_code_fence,
             hot_table_lookup,
             cold_lookup,
             draft_us + hot_table_lookup.lookup_us,
