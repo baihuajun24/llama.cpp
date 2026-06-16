@@ -1491,7 +1491,7 @@ int main(int argc, char ** argv) {
     while (!has_eos && (params.n_predict < 0 || n_predict < params.n_predict)) {
         const int remaining = params.n_predict < 0 ? n_draft : std::max(1, params.n_predict - n_predict);
         const int draft_limit = std::max(0, std::min(n_draft, remaining));
-        const int trusted_draft_limit = std::max(draft_limit, std::min(16, remaining));
+        const int trusted_draft_limit = std::max(draft_limit, std::min(32, remaining));
 
         const int64_t t_draft_start_us = ggml_time_us();
         const prompt_draft_result draft_result = prompt_local_draft(
