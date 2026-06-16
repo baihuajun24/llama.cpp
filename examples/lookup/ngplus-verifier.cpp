@@ -69,12 +69,15 @@ struct ngplus_params {
     int prompt_bytes = 0;
     int prompt_local_drafted_tokens = 0;
     int recent_generation_drafted_tokens = 0;
+    int static_hot_table_drafted_tokens = 0;
     int static_hot_table_hits = 0;
     int static_hot_table_misses = 0;
     int64_t static_hot_table_lookup_us_total = 0;
     int fallback_steps = 0;
     bool static_hot_table_loaded = false;
     bool static_hot_table_candidate_enabled = false;
+    int static_hot_table_candidate_min_count = 2;
+    int static_hot_table_candidate_min_top_share_pct = 100;
     int static_hot_table_order = 0;
     int static_hot_table_rows = 0;
     int64_t static_hot_table_bytes = 0;
@@ -102,6 +105,7 @@ struct prompt_draft_result {
     int continuation_available = 0;
     int continuation_copied = 0;
     bool truncated_by_draft_limit = false;
+    std::string source_label;
 };
 
 struct hot_table_entry {
@@ -153,6 +157,9 @@ static std::string draft_source_label(const prompt_draft_result & draft_result, 
     if (draft_result.tokens.empty()) {
         return "fallback";
     }
+    if (!draft_result.source_label.empty()) {
+        return draft_result.source_label;
+    }
     if (draft_result.source_pos >= 0 && draft_result.source_pos + draft_result.order <= prompt_tokens) {
         return "prompt-local-hot";
     }
@@ -163,6 +170,12 @@ static void print_ngplus_usage(int, char **) {
     printf("\n----- ngplus verifier params -----\n\n");
     printf("  --ngplus-hot-source SOURCES   comma-separated hot sources (default: prompt,hot-table)\n");
     printf("  --ngplus-hot-table-path FNAME load a Phase 4 static hot-table JSONL source for trace accounting\n");
+    printf("  --ngplus-hot-table-candidates on|off\n");
+    printf("                                allow high-confidence static hot-table one-token drafts (default: off)\n");
+    printf("  --ngplus-hot-table-min-count N\n");
+    printf("                                minimum top-token count for static hot-table drafts (default: 2)\n");
+    printf("  --ngplus-hot-table-min-top-share-pct N\n");
+    printf("                                minimum top-token share percentage for static hot-table drafts (default: 100)\n");
     printf("  --ngplus-hot-ngram-max N      maximum prompt-local hot n-gram order accepted by CLI (default: 6)\n");
     printf("  --ngplus-cold-path FNAME      cold-store path, currently traced as a no-op source\n");
     printf("  --ngplus-cold-mmap on|off     cold mmap flag, currently traced as a no-op source\n");
@@ -221,6 +234,16 @@ static int parse_positive_int(const std::string & value, const std::string & arg
         throw std::invalid_argument(arg + " must be >= 1");
     }
     return parsed;
+}
+
+static bool parse_on_off(const std::string & value, const std::string & arg) {
+    if (value == "on" || value == "true" || value == "1") {
+        return true;
+    }
+    if (value == "off" || value == "false" || value == "0") {
+        return false;
+    }
+    throw std::invalid_argument("invalid on/off value for " + arg + ": " + value);
 }
 
 #ifdef NGPLUS_USE_UPSTREAM_GEMMA4
@@ -335,6 +358,15 @@ static std::vector<std::string> preprocess_args(int argc, char ** argv, ngplus_p
             ngp.hot_source = value_for(name);
         } else if (name == "--ngplus-hot-table-path") {
             ngp.hot_table_path = value_for(name);
+        } else if (name == "--ngplus-hot-table-candidates") {
+            ngp.static_hot_table_candidate_enabled = parse_on_off(value_for(name), name);
+        } else if (name == "--ngplus-hot-table-min-count") {
+            ngp.static_hot_table_candidate_min_count = parse_positive_int(value_for(name), name);
+        } else if (name == "--ngplus-hot-table-min-top-share-pct") {
+            ngp.static_hot_table_candidate_min_top_share_pct = parse_positive_int(value_for(name), name);
+            if (ngp.static_hot_table_candidate_min_top_share_pct > 100) {
+                throw std::invalid_argument(name + " must be <= 100");
+            }
         } else if (name == "--ngplus-hot-ngram-max") {
             ngp.hot_ngram_max = parse_positive_int(value_for(name), name);
         } else if (name == "--ngplus-cold-path") {
@@ -1351,6 +1383,37 @@ static hot_table_lookup_result static_hot_table_lookup(
     return result;
 }
 
+static bool static_hot_table_candidate_allowed(
+        const hot_table_lookup_result & lookup,
+        const ngplus_params & ngp) {
+    if (!ngp.static_hot_table_candidate_enabled || !lookup.hit || lookup.top_token < 0) {
+        return false;
+    }
+    if (lookup.top_count < ngp.static_hot_table_candidate_min_count || lookup.total_count <= 0) {
+        return false;
+    }
+    return lookup.top_count * 100 >= lookup.total_count * ngp.static_hot_table_candidate_min_top_share_pct;
+}
+
+static prompt_draft_result static_hot_table_draft(
+        const hot_table_lookup_result & lookup,
+        const ngplus_params & ngp,
+        int draft_limit) {
+    prompt_draft_result result;
+    if (draft_limit <= 0 || !static_hot_table_candidate_allowed(lookup, ngp)) {
+        return result;
+    }
+    result.tokens.push_back(lookup.top_token);
+    result.order = lookup.order;
+    result.source_pos = -1;
+    result.continuation_start = -1;
+    result.continuation_available = lookup.candidate_count;
+    result.continuation_copied = 1;
+    result.truncated_by_draft_limit = false;
+    result.source_label = "static-hot-table";
+    return result;
+}
+
 static void trace_step(
         std::ofstream & trace,
         int step,
@@ -1466,6 +1529,8 @@ static void trace_step(
           << "\"static_hot_table_loaded\":" << (ngp.static_hot_table_loaded ? "true" : "false") << ","
           << "\"static_hot_table_path\":\"" << json_escape(ngp.hot_table_path) << "\","
           << "\"static_hot_table_candidate_enabled\":" << (ngp.static_hot_table_candidate_enabled ? "true" : "false") << ","
+          << "\"static_hot_table_candidate_min_count\":" << ngp.static_hot_table_candidate_min_count << ","
+          << "\"static_hot_table_candidate_min_top_share_pct\":" << ngp.static_hot_table_candidate_min_top_share_pct << ","
           << "\"static_hot_table_order\":" << ngp.static_hot_table_order << ","
           << "\"static_hot_table_rows\":" << ngp.static_hot_table_rows << ","
           << "\"static_hot_table_bytes\":" << ngp.static_hot_table_bytes << ","
@@ -1489,6 +1554,7 @@ static void trace_step(
           << "\"accepted_tokens\":" << accepted_tokens << ","
           << "\"prompt_local_drafted_tokens_total\":" << ngp.prompt_local_drafted_tokens << ","
           << "\"recent_generation_drafted_tokens_total\":" << ngp.recent_generation_drafted_tokens << ","
+          << "\"static_hot_table_drafted_tokens_total\":" << ngp.static_hot_table_drafted_tokens << ","
           << "\"fallback_steps_total\":" << ngp.fallback_steps << ","
           << "\"target_tokens\":" << target_tokens << ","
           << "\"fallback\":" << (drafted_tokens > 0 ? "false" : "true") << ","
@@ -1823,7 +1889,7 @@ int main(int argc, char ** argv) {
         }
 
         const int64_t t_draft_start_us = ggml_time_us();
-        const prompt_draft_result draft_result = prompt_local_draft(
+        prompt_draft_result draft_result = prompt_local_draft(
             history, ngp.effective_ngram_max, draft_limit, 4, trusted_draft_limit, ngp.prompt_tokens);
         const int64_t draft_us = ggml_time_us() - t_draft_start_us;
 
@@ -1840,12 +1906,18 @@ int main(int argc, char ** argv) {
         hot_table_lookup.lookup_us = ggml_time_us() - t_static_hot_lookup_start_us;
         ngp.static_hot_table_lookup_us_total += hot_table_lookup.lookup_us;
 
+        if (draft_result.tokens.empty() && static_hot_table_candidate_allowed(hot_table_lookup, ngp)) {
+            draft_result = static_hot_table_draft(hot_table_lookup, ngp, draft_limit);
+        }
+
         const llama_tokens & draft = draft_result.tokens;
         const std::string draft_source = draft_source_label(draft_result, ngp.prompt_tokens);
         if (draft_source == "prompt-local-hot") {
             ngp.prompt_local_drafted_tokens += (int) draft.size();
         } else if (draft_source == "recent-generation-hot") {
             ngp.recent_generation_drafted_tokens += (int) draft.size();
+        } else if (draft_source == "static-hot-table") {
+            ngp.static_hot_table_drafted_tokens += (int) draft.size();
         } else {
             ++ngp.fallback_steps;
         }
