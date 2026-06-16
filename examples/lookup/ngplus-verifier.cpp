@@ -35,7 +35,10 @@ struct ngplus_params {
     std::string reference_json_arg;
     std::string reference_prompt_text_arg;
     std::string reference_prompt_json_arg;
+    std::string dump_prompt_token_ids_path;
     std::vector<llama_token> reference_token_ids;
+    bool dump_no_bos = false;
+    bool dump_no_parse_special = false;
     bool stop_after_reference_mismatch = false;
     bool force_reference_tokens = false;
     int reference_text_bytes = 0;
@@ -123,6 +126,14 @@ static void print_ngplus_usage(int, char **) {
     printf("                                stop reference replay after the first mismatching generated token\n");
     printf("  --ngplus-force-reference-tokens\n");
     printf("                                diagnostic replay: accept reference tokens when present in sampler candidates\n");
+    printf("  --ngplus-dump-prompt-token-ids FNAME\n");
+    printf("                                write final prompt token IDs as JSON and exit before prompt eval\n");
+    printf("  --ngplus-dump-no-bos\n");
+    printf("                                omit BOS only for --ngplus-dump-prompt-token-ids tokenization\n");
+    printf("  --ngplus-dump-no-parse-special\n");
+    printf("                                disable special-token parsing only for --ngplus-dump-prompt-token-ids\n");
+    printf("  --ngplus-no-single-turn\n");
+    printf("                                disable the NG+ single-turn chat template for raw datastore tokenization\n");
 }
 
 static std::string require_value(int argc, char ** argv, int & i, const std::string & arg) {
@@ -287,6 +298,14 @@ static std::vector<std::string> preprocess_args(int argc, char ** argv, ngplus_p
             ngp.reference_prompt_text_arg = value_for(name);
         } else if (name == "--ngplus-reference-prompt-json") {
             ngp.reference_prompt_json_arg = value_for(name);
+        } else if (name == "--ngplus-dump-prompt-token-ids") {
+            ngp.dump_prompt_token_ids_path = value_for(name);
+        } else if (name == "--ngplus-dump-no-bos") {
+            ngp.dump_no_bos = true;
+        } else if (name == "--ngplus-dump-no-parse-special") {
+            ngp.dump_no_parse_special = true;
+        } else if (name == "--ngplus-no-single-turn") {
+            ngp.single_turn = false;
         } else if (name == "--ngplus-stop-after-reference-mismatch") {
             ngp.stop_after_reference_mismatch = true;
         } else if (name == "--ngplus-force-reference-tokens") {
@@ -640,6 +659,15 @@ static std::string token_ids_prefix_json(const std::vector<llama_token> & tokens
 static std::string token_ids_tail_json(const std::vector<llama_token> & tokens, size_t max_items) {
     const size_t begin = tokens.size() > max_items ? tokens.size() - max_items : 0;
     return token_ids_json(tokens, begin, tokens.size());
+}
+
+static bool write_token_ids_json_file(const std::string & path, const std::vector<llama_token> & tokens) {
+    std::ofstream out(path);
+    if (!out.is_open()) {
+        return false;
+    }
+    out << token_ids_json(tokens, 0, tokens.size()) << "\n";
+    return out.good();
 }
 
 static std::string token_pieces_json(
@@ -1382,7 +1410,10 @@ int main(int argc, char ** argv) {
     }
 #endif
 
-    std::vector<llama_token> history = common_tokenize(ctx, params.prompt, true, true);
+    const bool dump_mode = !ngp.dump_prompt_token_ids_path.empty();
+    const bool prompt_add_bos = !(dump_mode && ngp.dump_no_bos);
+    const bool prompt_parse_special = !(dump_mode && ngp.dump_no_parse_special);
+    std::vector<llama_token> history = common_tokenize(ctx, params.prompt, prompt_add_bos, prompt_parse_special);
     if (history.empty()) {
         LOG_ERR("prompt tokenization produced no tokens\n");
         llama_backend_free();
@@ -1398,6 +1429,18 @@ int main(int argc, char ** argv) {
     ngp.prompt_text = params.prompt;
     ngp.prompt_suffix = string_suffix(params.prompt, 512);
     ngp.chat_generation_prompt = params.sampling.generation_prompt;
+
+    if (!ngp.dump_prompt_token_ids_path.empty()) {
+        if (!write_token_ids_json_file(ngp.dump_prompt_token_ids_path, history)) {
+            LOG_ERR("failed to write --ngplus-dump-prompt-token-ids file: %s\n", ngp.dump_prompt_token_ids_path.c_str());
+            llama_backend_free();
+            return 1;
+        }
+        LOG_INF("ngplus: wrote %d prompt token IDs to %s\n", (int) history.size(), ngp.dump_prompt_token_ids_path.c_str());
+        llama_backend_free();
+        return 0;
+    }
+
     try {
         if (!ngp.reference_prompt_text_arg.empty() || !ngp.reference_prompt_json_arg.empty()) {
             const bool from_json = !ngp.reference_prompt_json_arg.empty();
