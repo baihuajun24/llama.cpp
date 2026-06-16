@@ -76,6 +76,7 @@ struct ngplus_params {
     int prompt_local_drafted_tokens = 0;
     int recent_generation_drafted_tokens = 0;
     int static_hot_table_drafted_tokens = 0;
+    int cold_store_drafted_tokens = 0;
     int static_hot_table_hits = 0;
     int static_hot_table_misses = 0;
     int64_t static_hot_table_lookup_us_total = 0;
@@ -90,6 +91,9 @@ struct ngplus_params {
     int64_t static_hot_table_load_us = 0;
     bool cold_store_enabled = false;
     bool cold_store_indexed = false;
+    bool cold_store_candidate_enabled = false;
+    int cold_store_candidate_min_count = 2;
+    int cold_store_candidate_min_top_share_pct = 50;
     bool cold_store_loaded = false;
     int cold_store_order = 0;
     int64_t cold_store_records = 0;
@@ -162,6 +166,9 @@ struct cold_mmap_store {
 struct cold_mmap_lookup_result {
     bool hit = false;
     int order = 0;
+    int total_count = 0;
+    llama_token top_token = -1;
+    int top_count = 0;
     int64_t lookup_us = 0;
     int64_t bytes_touched = 0;
 };
@@ -206,6 +213,7 @@ static void print_ngplus_usage(int, char **) {
     printf("                                include hot-table-candidates to enable guarded static table drafts\n");
     printf("                                include cold-store to enable read-only mmap cold lookup accounting\n");
     printf("                                include cold-store-indexed to mmap the .coldidx lookup sidecar\n");
+    printf("                                include cold-store-candidates to draft from indexed cold hits\n");
     printf("  --ngplus-hot-table-path FNAME load a Phase 4 static hot-table JSONL source for trace accounting\n");
     printf("  --ngplus-hot-table-candidates on|off\n");
     printf("                                allow high-confidence static hot-table one-token drafts (default: off)\n");
@@ -430,6 +438,12 @@ static void normalize_phase4_source_args(ngplus_params & ngp) {
             has_csv_token(ngp.hot_source, "indexed-cold-store")) {
         ngp.cold_store_enabled = true;
         ngp.cold_store_indexed = true;
+    }
+    if (has_csv_token(ngp.hot_source, "cold-store-candidates") ||
+            has_csv_token(ngp.hot_source, "indexed-cold-store-candidates")) {
+        ngp.cold_store_enabled = true;
+        ngp.cold_store_indexed = true;
+        ngp.cold_store_candidate_enabled = true;
     }
     if (ngp.hot_table_path.empty() && !ngp.cold_path.empty() && ends_with(ngp.cold_path, ".jsonl")) {
         ngp.hot_table_path = ngp.cold_path;
@@ -1626,6 +1640,10 @@ static cold_mmap_lookup_result cold_mmap_lookup(
             const int cmp = compare_cold_index_record(record, history, store.order);
             if (cmp == 0) {
                 result.hit = true;
+                const char * meta = record + store.order * sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint32_t);
+                result.total_count = (int) read_le32(meta);
+                result.top_token = (llama_token) read_le32(meta + sizeof(uint32_t));
+                result.top_count = (int) read_le32(meta + 2 * sizeof(uint32_t));
                 return result;
             }
             if (cmp < 0) {
@@ -1675,6 +1693,37 @@ static prompt_draft_result static_hot_table_draft(
     result.continuation_copied = 1;
     result.truncated_by_draft_limit = false;
     result.source_label = "static-hot-table";
+    return result;
+}
+
+static bool cold_store_candidate_allowed(
+        const cold_mmap_lookup_result & lookup,
+        const ngplus_params & ngp) {
+    if (!ngp.cold_store_candidate_enabled || !lookup.hit || lookup.top_token < 0) {
+        return false;
+    }
+    if (lookup.top_count < ngp.cold_store_candidate_min_count || lookup.total_count <= 0) {
+        return false;
+    }
+    return lookup.top_count * 100 >= lookup.total_count * ngp.cold_store_candidate_min_top_share_pct;
+}
+
+static prompt_draft_result cold_store_draft(
+        const cold_mmap_lookup_result & lookup,
+        const ngplus_params & ngp,
+        int draft_limit) {
+    prompt_draft_result result;
+    if (draft_limit <= 0 || !cold_store_candidate_allowed(lookup, ngp)) {
+        return result;
+    }
+    result.tokens.push_back(lookup.top_token);
+    result.order = lookup.order;
+    result.source_pos = -1;
+    result.continuation_start = -1;
+    result.continuation_available = 1;
+    result.continuation_copied = 1;
+    result.truncated_by_draft_limit = false;
+    result.source_label = "cold-store-index";
     return result;
 }
 
@@ -1796,6 +1845,9 @@ static void trace_step(
           << "\"cold_mmap\":\"" << json_escape(ngp.cold_mmap) << "\","
           << "\"cold_store_enabled\":" << (ngp.cold_store_enabled ? "true" : "false") << ","
           << "\"cold_store_indexed\":" << (ngp.cold_store_indexed ? "true" : "false") << ","
+          << "\"cold_store_candidate_enabled\":" << (ngp.cold_store_candidate_enabled ? "true" : "false") << ","
+          << "\"cold_store_candidate_min_count\":" << ngp.cold_store_candidate_min_count << ","
+          << "\"cold_store_candidate_min_top_share_pct\":" << ngp.cold_store_candidate_min_top_share_pct << ","
           << "\"cold_store_loaded\":" << (ngp.cold_store_loaded ? "true" : "false") << ","
           << "\"cold_store_order\":" << ngp.cold_store_order << ","
           << "\"cold_store_records\":" << ngp.cold_store_records << ","
@@ -1803,6 +1855,10 @@ static void trace_step(
           << "\"cold_store_load_us\":" << ngp.cold_store_load_us << ","
           << "\"cold_store_hit\":" << (cold_lookup.hit ? "true" : "false") << ","
           << "\"cold_store_lookup_order\":" << cold_lookup.order << ","
+          << "\"cold_store_total_count\":" << cold_lookup.total_count << ","
+          << "\"cold_store_top_token\":"
+          << (cold_lookup.top_token >= 0 ? std::to_string(cold_lookup.top_token) : "null") << ","
+          << "\"cold_store_top_count\":" << cold_lookup.top_count << ","
           << "\"cold_store_lookup_us\":" << cold_lookup.lookup_us << ","
           << "\"cold_store_bytes_touched\":" << cold_lookup.bytes_touched << ","
           << "\"cold_store_hits_total\":" << ngp.cold_store_hits << ","
@@ -1838,6 +1894,7 @@ static void trace_step(
           << "\"prompt_local_drafted_tokens_total\":" << ngp.prompt_local_drafted_tokens << ","
           << "\"recent_generation_drafted_tokens_total\":" << ngp.recent_generation_drafted_tokens << ","
           << "\"static_hot_table_drafted_tokens_total\":" << ngp.static_hot_table_drafted_tokens << ","
+          << "\"cold_store_drafted_tokens_total\":" << ngp.cold_store_drafted_tokens << ","
           << "\"fallback_steps_total\":" << ngp.fallback_steps << ","
           << "\"target_tokens\":" << target_tokens << ","
           << "\"fallback\":" << (drafted_tokens > 0 ? "false" : "true") << ","
@@ -2234,6 +2291,9 @@ int main(int argc, char ** argv) {
         if (draft_result.tokens.empty() && static_hot_table_candidate_allowed(hot_table_lookup, ngp)) {
             draft_result = static_hot_table_draft(hot_table_lookup, ngp, draft_limit);
         }
+        if (draft_result.tokens.empty() && cold_store_candidate_allowed(cold_lookup, ngp)) {
+            draft_result = cold_store_draft(cold_lookup, ngp, draft_limit);
+        }
 
         const llama_tokens & draft = draft_result.tokens;
         const std::string draft_source = draft_source_label(draft_result, ngp.prompt_tokens);
@@ -2243,6 +2303,8 @@ int main(int argc, char ** argv) {
             ngp.recent_generation_drafted_tokens += (int) draft.size();
         } else if (draft_source == "static-hot-table") {
             ngp.static_hot_table_drafted_tokens += (int) draft.size();
+        } else if (draft_source == "cold-store-index") {
+            ngp.cold_store_drafted_tokens += (int) draft.size();
         } else {
             ++ngp.fallback_steps;
         }
@@ -2542,6 +2604,7 @@ int main(int argc, char ** argv) {
     LOG_INF("n_drafted    = %d\n", n_drafted);
     LOG_INF("n_drafted_prompt_local = %d\n", ngp.prompt_local_drafted_tokens);
     LOG_INF("n_drafted_recent_gen   = %d\n", ngp.recent_generation_drafted_tokens);
+    LOG_INF("n_drafted_cold_store   = %d\n", ngp.cold_store_drafted_tokens);
     LOG_INF("cold_store_hits        = %d\n", ngp.cold_store_hits);
     LOG_INF("cold_store_misses      = %d\n", ngp.cold_store_misses);
     LOG_INF("fallback_steps         = %d\n", ngp.fallback_steps);
