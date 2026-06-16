@@ -1476,6 +1476,7 @@ int main(int argc, char ** argv) {
     ngp.prompt_sampler_seeded = true;
 
     int n_past = (int) history.size();
+    ngp.draft_acceptance_enabled = true;
 
     const auto t_dec_start = ggml_time_us();
     int step = 0;
@@ -1502,70 +1503,135 @@ int main(int argc, char ** argv) {
         }
 
         const int64_t t_verify_start_us = ggml_time_us();
-        llama_token reference_current_token = -1;
-        if (generated_token_ids.size() < ngp.reference_token_ids.size()) {
-            reference_current_token = ngp.reference_token_ids[generated_token_ids.size()];
-        }
-        llama_token id = common_sampler_sample(smpl, ctx, -1);
-        const llama_token sampler_selected_token = id;
-        const std::string sampler_selected_piece =
-            llama_vocab_is_eog(vocab, sampler_selected_token) ?
-                std::string() :
-                common_token_to_piece(ctx, sampler_selected_token);
+        llama_token id = -1;
+        llama_token sampler_selected_token = -1;
+        std::string sampler_selected_piece;
         int reference_forced_rank = -1;
         bool reference_forced = false;
-#ifdef NGPLUS_USE_UPSTREAM_GEMMA4
-        reference_forced_rank = reference_candidate_rank(smpl, reference_current_token);
-        if (ngp.force_reference_tokens &&
-                reference_current_token >= 0 &&
-                reference_forced_rank >= 0 &&
-                reference_current_token != id) {
-            id = reference_current_token;
-            reference_forced = true;
-        }
-        const std::string top_candidates = top_candidates_json(ctx, smpl, 5, id);
-        const std::string sampler_diagnostics =
-            sampler_diagnostics_json(smpl, params.sampling, sampler_selected_token);
-        const std::string logit_surface = logit_surface_json(smpl, 32);
-        const std::string raw_logit_surface = raw_logit_surface_json(ctx, vocab, reference_current_token, 32);
-        const std::string reference_current_candidate =
-            reference_candidate_json(ctx, smpl, reference_current_token, id);
-#else
-        const std::string top_candidates = "[]";
-        const std::string sampler_diagnostics = "null";
-        const std::string logit_surface = "null";
-        const std::string raw_logit_surface = "null";
-        const std::string reference_current_candidate = "null";
-#endif
-        common_sampler_accept(smpl, id, true);
+        std::string top_candidates = "[]";
+        std::string sampler_diagnostics = "null";
+        std::string logit_surface = "null";
+        std::string raw_logit_surface = "null";
+        std::string reference_current_candidate = "null";
+        int accepted_from_draft = 0;
+        int target_tokens_this_step = 0;
+        bool decode_failed = false;
+        bool trace_sample_captured = false;
+        const bool trace_step_diagnostics =
+            ngp.force_reference_tokens ||
+            !ngp.reference_token_ids.empty() ||
+            ngp.stop_after_reference_mismatch;
 
-        const int accepted_from_draft = 0;
+        const auto decode_next_token = [&](llama_token token) -> bool {
+            const bool need_next_logits =
+                !has_eos && (params.n_predict < 0 || n_predict < params.n_predict);
+            if (!need_next_logits) {
+                return true;
+            }
+
+            common_batch_clear(batch_tgt);
+            common_batch_add(batch_tgt, token, n_past, { 0 }, true);
+            if (llama_decode(ctx, batch_tgt) != 0) {
+                LOG_ERR("target decode failed during PLD-style NG+ verification\n");
+                return false;
+            }
+            ++n_past;
+            return true;
+        };
+
+        const auto emit_token = [&](llama_token token) -> void {
+            history.push_back(token);
+            if (llama_vocab_is_eog(vocab, token)) {
+                has_eos = true;
+                return;
+            }
+
+            const std::string token_str = common_token_to_piece(ctx, token);
+            LOG("%s", token_str.c_str());
+            generated_text << token_str;
+            generated_token_ids.push_back(token);
+            ++n_predict;
+        };
+
+        const auto sample_current = [&](int logits_idx) -> llama_token {
+            llama_token reference_current_token = -1;
+            if (generated_token_ids.size() < ngp.reference_token_ids.size()) {
+                reference_current_token = ngp.reference_token_ids[generated_token_ids.size()];
+            }
+
+            llama_token sampled = common_sampler_sample(smpl, ctx, logits_idx);
+            const llama_token original_sampled = sampled;
+            int current_reference_forced_rank = -1;
+            bool current_reference_forced = false;
+#ifdef NGPLUS_USE_UPSTREAM_GEMMA4
+            if (trace_step_diagnostics) {
+                current_reference_forced_rank = reference_candidate_rank(smpl, reference_current_token);
+            }
+            if (ngp.force_reference_tokens &&
+                    reference_current_token >= 0 &&
+                    current_reference_forced_rank >= 0 &&
+                    reference_current_token != sampled) {
+                sampled = reference_current_token;
+                current_reference_forced = true;
+            }
+#endif
+
+            if (!trace_sample_captured) {
+                id = sampled;
+                sampler_selected_token = original_sampled;
+                sampler_selected_piece =
+                    llama_vocab_is_eog(vocab, sampler_selected_token) ?
+                        std::string() :
+                        common_token_to_piece(ctx, sampler_selected_token);
+                reference_forced_rank = current_reference_forced_rank;
+                reference_forced = current_reference_forced;
+#ifdef NGPLUS_USE_UPSTREAM_GEMMA4
+                if (trace_step_diagnostics) {
+                    top_candidates = top_candidates_json(ctx, smpl, 5, sampled);
+                    sampler_diagnostics = sampler_diagnostics_json(smpl, params.sampling, sampler_selected_token);
+                    logit_surface = logit_surface_json(smpl, 32);
+                    raw_logit_surface = raw_logit_surface_json(ctx, vocab, reference_current_token, 32);
+                    reference_current_candidate = reference_candidate_json(ctx, smpl, reference_current_token, sampled);
+                }
+#endif
+                trace_sample_captured = true;
+            }
+
+            common_sampler_accept(smpl, sampled, true);
+            return sampled;
+        };
+
+        for (int i_dft = 0; ; ++i_dft) {
+            if (params.n_predict >= 0 && n_predict >= params.n_predict) {
+                break;
+            }
+
+            llama_token sampled = sample_current(-1);
+
+            const bool accepted_current =
+                i_dft < (int) draft.size() && sampled == draft[i_dft];
+            if (accepted_current) {
+                ++accepted_from_draft;
+            }
+
+            emit_token(sampled);
+            ++target_tokens_this_step;
+
+            if (has_eos || (params.n_predict >= 0 && n_predict >= params.n_predict)) {
+                break;
+            }
+            if (!decode_next_token(sampled)) {
+                decode_failed = true;
+                break;
+            }
+            if (!accepted_current || i_dft + 1 >= (int) draft.size()) {
+                break;
+            }
+        }
+
         n_drafted += (int) draft.size();
         n_accept += accepted_from_draft;
 
-        history.push_back(id);
-
-        if (llama_vocab_is_eog(vocab, id)) {
-            has_eos = true;
-        } else {
-            const std::string token_str = common_token_to_piece(ctx, id);
-            LOG("%s", token_str.c_str());
-            generated_text << token_str;
-            generated_token_ids.push_back(id);
-            ++n_predict;
-        }
-
-        const bool need_next_logits =
-            !has_eos && (params.n_predict < 0 || n_predict < params.n_predict);
-        if (need_next_logits) {
-            common_batch_clear(batch_tgt);
-            common_batch_add(batch_tgt, id, n_past, { 0 }, true);
-            if (llama_decode(ctx, batch_tgt) != 0) {
-                LOG_ERR("target decode failed during AR-exact NG+ verification\n");
-                break;
-            }
-            ++n_past;
-        }
         const int64_t verify_us = ggml_time_us() - t_verify_start_us;
 
         const int64_t t_kv_start_us = ggml_time_us();
@@ -1618,7 +1684,7 @@ int main(int argc, char ** argv) {
             ngp,
             (int) draft.size(),
             accepted_from_draft,
-            1,
+            target_tokens_this_step,
             draft_result.order,
             draft_result.source_pos,
             draft_result.continuation_start,
@@ -1671,6 +1737,9 @@ int main(int argc, char ** argv) {
         previous_sampled_piece = llama_vocab_is_eog(vocab, id) ? std::string() : common_token_to_piece(ctx, id);
 
         if (ngp.stop_after_reference_mismatch && has_reference && reference_first_mismatch >= 0) {
+            break;
+        }
+        if (decode_failed) {
             break;
         }
     }
