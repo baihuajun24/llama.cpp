@@ -1033,7 +1033,8 @@ static prompt_draft_result prompt_local_draft(
         int max_order,
         int max_draft,
         int trusted_order_min,
-        int trusted_max_draft) {
+        int trusted_max_draft,
+        int prompt_tokens) {
     prompt_draft_result result;
     if (max_draft <= 0 || history.size() < 2) {
         return result;
@@ -1057,6 +1058,9 @@ static prompt_draft_result prompt_local_draft(
             }
 
             const int continuation_start = pos + order;
+            if (continuation_start >= prompt_tokens) {
+                continue;
+            }
             const int available = history_size - continuation_start;
             const int order_max_draft =
                 order >= trusted_order_min ? std::max(max_draft, trusted_max_draft) : max_draft;
@@ -1498,7 +1502,7 @@ int main(int argc, char ** argv) {
 
         const int64_t t_draft_start_us = ggml_time_us();
         const prompt_draft_result draft_result = prompt_local_draft(
-            history, ngp.effective_ngram_max, draft_limit, 4, trusted_draft_limit);
+            history, ngp.effective_ngram_max, draft_limit, 4, trusted_draft_limit, ngp.prompt_tokens);
         const int64_t draft_us = ggml_time_us() - t_draft_start_us;
 
         const llama_tokens & draft = draft_result.tokens;
