@@ -1061,6 +1061,9 @@ static prompt_draft_result prompt_local_draft(
             if (continuation_start >= prompt_tokens) {
                 continue;
             }
+            if (order < 4) {
+                continue;
+            }
             if (order == 2 && pos > 11) {
                 continue;
             }
