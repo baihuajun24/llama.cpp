@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
+#include <unordered_map>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -26,6 +27,7 @@
 
 struct ngplus_params {
     std::string hot_source = "prompt,hot-table";
+    std::string hot_table_path;
     std::string cold_path;
     std::string cold_mmap = "on";
     std::string trace_path;
@@ -67,7 +69,16 @@ struct ngplus_params {
     int prompt_bytes = 0;
     int prompt_local_drafted_tokens = 0;
     int recent_generation_drafted_tokens = 0;
+    int static_hot_table_hits = 0;
+    int static_hot_table_misses = 0;
+    int64_t static_hot_table_lookup_us_total = 0;
     int fallback_steps = 0;
+    bool static_hot_table_loaded = false;
+    bool static_hot_table_candidate_enabled = false;
+    int static_hot_table_order = 0;
+    int static_hot_table_rows = 0;
+    int64_t static_hot_table_bytes = 0;
+    int64_t static_hot_table_load_us = 0;
     std::string prompt_fingerprint;
     std::string prompt_token_head_json = "[]";
     std::string prompt_token_tail_json = "[]";
@@ -93,6 +104,51 @@ struct prompt_draft_result {
     bool truncated_by_draft_limit = false;
 };
 
+struct hot_table_entry {
+    llama_tokens context;
+    std::vector<std::pair<llama_token, int>> next;
+    int total_count = 0;
+    int rank = -1;
+};
+
+struct hot_table_lookup_result {
+    bool hit = false;
+    int order = 0;
+    int total_count = 0;
+    int rank = -1;
+    llama_token top_token = -1;
+    int top_count = 0;
+    int candidate_count = 0;
+    int64_t lookup_us = 0;
+};
+
+struct static_hot_table {
+    int order = 0;
+    int64_t bytes = 0;
+    std::unordered_map<std::string, hot_table_entry> entries;
+};
+
+static std::string token_key(const llama_tokens & tokens) {
+    std::ostringstream out;
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (i > 0) {
+            out << ",";
+        }
+        out << tokens[i];
+    }
+    return out.str();
+}
+
+static std::string token_key_suffix(const std::vector<llama_token> & tokens, int order) {
+    if (order <= 0 || (int) tokens.size() < order) {
+        return "";
+    }
+    llama_tokens suffix;
+    suffix.reserve(order);
+    suffix.insert(suffix.end(), tokens.end() - order, tokens.end());
+    return token_key(suffix);
+}
+
 static std::string draft_source_label(const prompt_draft_result & draft_result, int prompt_tokens) {
     if (draft_result.tokens.empty()) {
         return "fallback";
@@ -106,6 +162,7 @@ static std::string draft_source_label(const prompt_draft_result & draft_result, 
 static void print_ngplus_usage(int, char **) {
     printf("\n----- ngplus verifier params -----\n\n");
     printf("  --ngplus-hot-source SOURCES   comma-separated hot sources (default: prompt,hot-table)\n");
+    printf("  --ngplus-hot-table-path FNAME load a Phase 4 static hot-table JSONL source for trace accounting\n");
     printf("  --ngplus-hot-ngram-max N      maximum prompt-local hot n-gram order accepted by CLI (default: 6)\n");
     printf("  --ngplus-cold-path FNAME      cold-store path, currently traced as a no-op source\n");
     printf("  --ngplus-cold-mmap on|off     cold mmap flag, currently traced as a no-op source\n");
@@ -276,6 +333,8 @@ static std::vector<std::string> preprocess_args(int argc, char ** argv, ngplus_p
 
         if (name == "--ngplus-hot-source") {
             ngp.hot_source = value_for(name);
+        } else if (name == "--ngplus-hot-table-path") {
+            ngp.hot_table_path = value_for(name);
         } else if (name == "--ngplus-hot-ngram-max") {
             ngp.hot_ngram_max = parse_positive_int(value_for(name), name);
         } else if (name == "--ngplus-cold-path") {
@@ -1126,6 +1185,172 @@ static prompt_draft_result prompt_local_draft(
     return result;
 }
 
+static int parse_int_field(const std::string & line, const std::string & key, int default_value) {
+    const std::string needle = "\"" + key + "\":";
+    const size_t pos = line.find(needle);
+    if (pos == std::string::npos) {
+        return default_value;
+    }
+    size_t begin = pos + needle.size();
+    size_t end = begin;
+    if (end < line.size() && line[end] == '-') {
+        ++end;
+    }
+    while (end < line.size() && std::isdigit((unsigned char) line[end])) {
+        ++end;
+    }
+    if (end == begin || (end == begin + 1 && line[begin] == '-')) {
+        return default_value;
+    }
+    return std::stoi(line.substr(begin, end - begin));
+}
+
+static llama_tokens parse_token_array_field(const std::string & line, const std::string & key) {
+    const std::string needle = "\"" + key + "\":[";
+    const size_t pos = line.find(needle);
+    if (pos == std::string::npos) {
+        throw std::invalid_argument("missing " + key + " array");
+    }
+    size_t cursor = pos + needle.size();
+    const size_t end_array = line.find(']', cursor);
+    if (end_array == std::string::npos) {
+        throw std::invalid_argument("unterminated " + key + " array");
+    }
+
+    llama_tokens tokens;
+    while (cursor < end_array) {
+        while (cursor < end_array && (line[cursor] == ',' || std::isspace((unsigned char) line[cursor]))) {
+            ++cursor;
+        }
+        if (cursor >= end_array) {
+            break;
+        }
+        size_t end = cursor;
+        if (end < end_array && line[end] == '-') {
+            ++end;
+        }
+        while (end < end_array && std::isdigit((unsigned char) line[end])) {
+            ++end;
+        }
+        if (end == cursor || (end == cursor + 1 && line[cursor] == '-')) {
+            throw std::invalid_argument("invalid integer in " + key + " array");
+        }
+        tokens.push_back((llama_token) std::stoi(line.substr(cursor, end - cursor)));
+        cursor = end;
+    }
+    return tokens;
+}
+
+static std::vector<std::pair<llama_token, int>> parse_next_pairs(const std::string & line) {
+    const std::string needle = "\"next\":[";
+    size_t cursor = line.find(needle);
+    if (cursor == std::string::npos) {
+        throw std::invalid_argument("missing next array");
+    }
+    cursor += needle.size();
+
+    std::vector<std::pair<llama_token, int>> next;
+    while (true) {
+        const size_t obj = line.find("{\"count\":", cursor);
+        if (obj == std::string::npos) {
+            break;
+        }
+        const size_t token_key = line.find("\"token\":", obj);
+        if (token_key == std::string::npos) {
+            throw std::invalid_argument("next entry missing token");
+        }
+        const size_t obj_end = line.find('}', token_key);
+        if (obj_end == std::string::npos) {
+            throw std::invalid_argument("unterminated next entry");
+        }
+
+        const int count = parse_int_field(line.substr(obj, obj_end - obj + 1), "count", 0);
+        const int token = parse_int_field(line.substr(obj, obj_end - obj + 1), "token", -1);
+        if (token >= 0) {
+            next.emplace_back((llama_token) token, count);
+        }
+        cursor = obj_end + 1;
+    }
+    return next;
+}
+
+static static_hot_table load_static_hot_table(const std::string & path) {
+    static_hot_table table;
+    if (path.empty()) {
+        return table;
+    }
+
+    std::ifstream bytes_in(path, std::ios::binary | std::ios::ate);
+    if (!bytes_in.is_open()) {
+        throw std::invalid_argument("failed to open --ngplus-hot-table-path: " + path);
+    }
+    table.bytes = (int64_t) bytes_in.tellg();
+    bytes_in.close();
+
+    std::ifstream in(path);
+    if (!in.is_open()) {
+        throw std::invalid_argument("failed to read --ngplus-hot-table-path: " + path);
+    }
+
+    std::string line;
+    int line_no = 0;
+    while (std::getline(in, line)) {
+        ++line_no;
+        if (line.empty()) {
+            continue;
+        }
+        try {
+            hot_table_entry entry;
+            entry.context = parse_token_array_field(line, "context");
+            entry.next = parse_next_pairs(line);
+            entry.total_count = parse_int_field(line, "total_count", 0);
+            entry.rank = parse_int_field(line, "rank", -1);
+            if (entry.context.empty() || entry.next.empty()) {
+                continue;
+            }
+            if (table.order == 0) {
+                table.order = (int) entry.context.size();
+            }
+            if ((int) entry.context.size() != table.order) {
+                throw std::invalid_argument("hot-table row order mismatch");
+            }
+            table.entries.emplace(token_key(entry.context), std::move(entry));
+        } catch (const std::exception & e) {
+            throw std::invalid_argument(
+                "invalid hot-table JSONL at line " + std::to_string(line_no) + ": " + e.what());
+        }
+    }
+
+    return table;
+}
+
+static hot_table_lookup_result static_hot_table_lookup(
+        const static_hot_table & table,
+        const std::vector<llama_token> & history) {
+    hot_table_lookup_result result;
+    result.order = table.order;
+    if (table.order <= 0 || (int) history.size() < table.order) {
+        return result;
+    }
+
+    const std::string key = token_key_suffix(history, table.order);
+    const auto it = table.entries.find(key);
+    if (it == table.entries.end()) {
+        return result;
+    }
+
+    const hot_table_entry & entry = it->second;
+    result.hit = true;
+    result.total_count = entry.total_count;
+    result.rank = entry.rank;
+    result.candidate_count = (int) entry.next.size();
+    if (!entry.next.empty()) {
+        result.top_token = entry.next[0].first;
+        result.top_count = entry.next[0].second;
+    }
+    return result;
+}
+
 static void trace_step(
         std::ofstream & trace,
         int step,
@@ -1139,6 +1364,7 @@ static void trace_step(
         int source_continuation_available,
         int source_continuation_copied,
         bool source_truncated_by_draft_limit,
+        const hot_table_lookup_result & hot_table_lookup,
         int64_t hot_lookup_us,
         int64_t tree_build_us,
         int64_t target_verify_us,
@@ -1237,6 +1463,26 @@ static void trace_step(
           << "\"source_truncated_by_draft_limit\":" << (source_truncated_by_draft_limit ? "true" : "false") << ","
           << "\"source_truncation_reason\":"
           << (source_truncated_by_draft_limit ? "\"ngplus_draft_limit\"" : "null") << ","
+          << "\"static_hot_table_loaded\":" << (ngp.static_hot_table_loaded ? "true" : "false") << ","
+          << "\"static_hot_table_path\":\"" << json_escape(ngp.hot_table_path) << "\","
+          << "\"static_hot_table_candidate_enabled\":" << (ngp.static_hot_table_candidate_enabled ? "true" : "false") << ","
+          << "\"static_hot_table_order\":" << ngp.static_hot_table_order << ","
+          << "\"static_hot_table_rows\":" << ngp.static_hot_table_rows << ","
+          << "\"static_hot_table_bytes\":" << ngp.static_hot_table_bytes << ","
+          << "\"static_hot_table_load_us\":" << ngp.static_hot_table_load_us << ","
+          << "\"static_hot_table_hit\":" << (hot_table_lookup.hit ? "true" : "false") << ","
+          << "\"static_hot_table_lookup_us\":" << hot_table_lookup.lookup_us << ","
+          << "\"static_hot_table_lookup_order\":" << hot_table_lookup.order << ","
+          << "\"static_hot_table_lookup_rank\":"
+          << (hot_table_lookup.rank >= 0 ? std::to_string(hot_table_lookup.rank) : "null") << ","
+          << "\"static_hot_table_total_count\":" << hot_table_lookup.total_count << ","
+          << "\"static_hot_table_candidate_count\":" << hot_table_lookup.candidate_count << ","
+          << "\"static_hot_table_top_token\":"
+          << (hot_table_lookup.top_token >= 0 ? std::to_string(hot_table_lookup.top_token) : "null") << ","
+          << "\"static_hot_table_top_count\":" << hot_table_lookup.top_count << ","
+          << "\"static_hot_table_hits_total\":" << ngp.static_hot_table_hits << ","
+          << "\"static_hot_table_misses_total\":" << ngp.static_hot_table_misses << ","
+          << "\"static_hot_table_lookup_us_total\":" << ngp.static_hot_table_lookup_us_total << ","
           << "\"ngplus_draft\":" << ngp.draft << ","
           << "\"tree_budget\":" << ngp.tree_budget << ","
           << "\"drafted_tokens\":" << drafted_tokens << ","
@@ -1459,8 +1705,29 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    static_hot_table hot_table;
     const int64_t t_hot_init_start_us = ggml_time_us();
+    try {
+        if (!ngp.hot_table_path.empty()) {
+            hot_table = load_static_hot_table(ngp.hot_table_path);
+            ngp.static_hot_table_loaded = !hot_table.entries.empty();
+            ngp.static_hot_table_order = hot_table.order;
+            ngp.static_hot_table_rows = (int) hot_table.entries.size();
+            ngp.static_hot_table_bytes = hot_table.bytes;
+            LOG_INF(
+                "ngplus: loaded static hot table rows=%d order=%d bytes=%lld from %s\n",
+                ngp.static_hot_table_rows,
+                ngp.static_hot_table_order,
+                (long long) ngp.static_hot_table_bytes,
+                ngp.hot_table_path.c_str());
+        }
+    } catch (const std::exception & e) {
+        LOG_ERR("%s\n", e.what());
+        llama_backend_free();
+        return 1;
+    }
     const int64_t t_hot_init_us = ggml_time_us() - t_hot_init_start_us;
+    ngp.static_hot_table_load_us = t_hot_init_us;
 
     const int max_context_size = llama_n_ctx(ctx);
     const int max_tokens_list_size = max_context_size - 4;
@@ -1559,6 +1826,19 @@ int main(int argc, char ** argv) {
         const prompt_draft_result draft_result = prompt_local_draft(
             history, ngp.effective_ngram_max, draft_limit, 4, trusted_draft_limit, ngp.prompt_tokens);
         const int64_t draft_us = ggml_time_us() - t_draft_start_us;
+
+        hot_table_lookup_result hot_table_lookup;
+        const int64_t t_static_hot_lookup_start_us = ggml_time_us();
+        if (ngp.static_hot_table_loaded) {
+            hot_table_lookup = static_hot_table_lookup(hot_table, history);
+            if (hot_table_lookup.hit) {
+                ++ngp.static_hot_table_hits;
+            } else {
+                ++ngp.static_hot_table_misses;
+            }
+        }
+        hot_table_lookup.lookup_us = ggml_time_us() - t_static_hot_lookup_start_us;
+        ngp.static_hot_table_lookup_us_total += hot_table_lookup.lookup_us;
 
         const llama_tokens & draft = draft_result.tokens;
         const std::string draft_source = draft_source_label(draft_result, ngp.prompt_tokens);
@@ -1794,7 +2074,8 @@ int main(int argc, char ** argv) {
             draft_result.continuation_available,
             draft_result.continuation_copied,
             draft_result.truncated_by_draft_limit,
-            draft_us,
+            hot_table_lookup,
+            draft_us + hot_table_lookup.lookup_us,
             draft_us,
             verify_us,
             kv_cleanup_us,
