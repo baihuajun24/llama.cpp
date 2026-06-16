@@ -1677,6 +1677,7 @@ int main(int argc, char ** argv) {
             reference_expected_token >= 0 ? common_token_to_piece(ctx, reference_expected_token) : std::string();
         const std::string reference_actual_piece =
             reference_actual_token >= 0 ? common_token_to_piece(ctx, reference_actual_token) : std::string();
+        const bool trace_sequence_diagnostics = trace_step_diagnostics || generated_full_sequence_final;
 
         trace_step(
             trace,
@@ -1701,17 +1702,18 @@ int main(int argc, char ** argv) {
             llama_vocab_is_eog(vocab, id) ? std::string() : common_token_to_piece(ctx, id),
             previous_sampled_piece,
             draft_source,
-            string_prefix(generated_text_snapshot, 256),
+            trace_step_diagnostics ? string_prefix(generated_text_snapshot, 256) : std::string(),
             generated_full_sequence_final ? generated_text_snapshot : std::string(),
             (int) generated_text_snapshot.size(),
             generated_text_fnv1a64,
             generated_response_json_final,
             generated_full_sequence_final ? token_ids_json(generated_token_ids, 0, generated_token_ids.size()) : "[]",
-            token_ids_prefix_json(generated_token_ids, 32),
-            token_ids_tail_json(generated_token_ids, 16),
-            generated_full_sequence_final ? token_pieces_json(ctx, generated_token_ids, 0, generated_token_ids.size()) : "[]",
-            token_pieces_prefix_json(ctx, generated_token_ids, 32),
-            token_pieces_tail_json(ctx, generated_token_ids, 16),
+            trace_sequence_diagnostics ? token_ids_prefix_json(generated_token_ids, 32) : "[]",
+            trace_sequence_diagnostics ? token_ids_tail_json(generated_token_ids, 16) : "[]",
+            (trace_step_diagnostics && generated_full_sequence_final) ?
+                token_pieces_json(ctx, generated_token_ids, 0, generated_token_ids.size()) : "[]",
+            trace_step_diagnostics ? token_pieces_prefix_json(ctx, generated_token_ids, 32) : "[]",
+            trace_step_diagnostics ? token_pieces_tail_json(ctx, generated_token_ids, 16) : "[]",
             top_candidates,
             sampler_diagnostics,
             logit_surface,
