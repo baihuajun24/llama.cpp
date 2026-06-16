@@ -1031,7 +1031,9 @@ static bool apply_single_turn_chat_template(common_params & params, llama_model 
 static prompt_draft_result prompt_local_draft(
         const std::vector<llama_token> & history,
         int max_order,
-        int max_draft) {
+        int max_draft,
+        int trusted_order_min,
+        int trusted_max_draft) {
     prompt_draft_result result;
     if (max_draft <= 0 || history.size() < 2) {
         return result;
@@ -1056,7 +1058,9 @@ static prompt_draft_result prompt_local_draft(
 
             const int continuation_start = pos + order;
             const int available = history_size - continuation_start;
-            const int n_copy = std::min(max_draft, available);
+            const int order_max_draft =
+                order >= trusted_order_min ? std::max(max_draft, trusted_max_draft) : max_draft;
+            const int n_copy = std::min(order_max_draft, available);
             if (n_copy <= 0) {
                 continue;
             }
@@ -1487,9 +1491,11 @@ int main(int argc, char ** argv) {
     while (!has_eos && (params.n_predict < 0 || n_predict < params.n_predict)) {
         const int remaining = params.n_predict < 0 ? n_draft : std::max(1, params.n_predict - n_predict);
         const int draft_limit = std::max(0, std::min(n_draft, remaining));
+        const int trusted_draft_limit = std::max(draft_limit, std::min(16, remaining));
 
         const int64_t t_draft_start_us = ggml_time_us();
-        const prompt_draft_result draft_result = prompt_local_draft(history, ngp.effective_ngram_max, draft_limit);
+        const prompt_draft_result draft_result = prompt_local_draft(
+            history, ngp.effective_ngram_max, draft_limit, 4, trusted_draft_limit);
         const int64_t draft_us = ggml_time_us() - t_draft_start_us;
 
         const llama_tokens & draft = draft_result.tokens;
