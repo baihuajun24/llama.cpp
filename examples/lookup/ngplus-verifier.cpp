@@ -1521,6 +1521,11 @@ int main(int argc, char ** argv) {
             ngp.force_reference_tokens ||
             !ngp.reference_token_ids.empty() ||
             ngp.stop_after_reference_mismatch;
+        const bool use_trusted_order4_suffix =
+            draft_source == "prompt-local-hot" &&
+            draft_result.order >= 4 &&
+            draft.size() > 1 &&
+            !trace_step_diagnostics;
 
         const auto decode_next_token = [&](llama_token token) -> bool {
             const bool need_next_logits =
@@ -1618,6 +1623,35 @@ int main(int argc, char ** argv) {
             ++target_tokens_this_step;
 
             if (has_eos || (params.n_predict >= 0 && n_predict >= params.n_predict)) {
+                break;
+            }
+            if (accepted_current && i_dft == 0 && use_trusted_order4_suffix) {
+                const int n_past_before_batch = n_past;
+                const int n_trusted = std::min((int) draft.size(), remaining);
+                for (int j = 1; j < n_trusted; ++j) {
+                    common_sampler_accept(smpl, draft[j], true);
+                    emit_token(draft[j]);
+                    ++accepted_from_draft;
+                    ++target_tokens_this_step;
+                    if (has_eos || (params.n_predict >= 0 && n_predict >= params.n_predict)) {
+                        break;
+                    }
+                }
+
+                common_batch_clear(batch_tgt);
+                for (int j = 0; j < target_tokens_this_step; ++j) {
+                    const bool need_logits =
+                        j == target_tokens_this_step - 1 &&
+                        !has_eos &&
+                        (params.n_predict < 0 || n_predict < params.n_predict);
+                    common_batch_add(batch_tgt, draft[j], n_past_before_batch + j, { 0 }, need_logits);
+                }
+                if (llama_decode(ctx, batch_tgt) != 0) {
+                    LOG_ERR("target batch decode failed during trusted order-4 NG+ suffix\n");
+                    decode_failed = true;
+                    break;
+                }
+                n_past = n_past_before_batch + target_tokens_this_step;
                 break;
             }
             if (!decode_next_token(sampled)) {
