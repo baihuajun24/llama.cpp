@@ -1065,8 +1065,11 @@ static prompt_draft_result prompt_local_draft(
                 continue;
             }
             const int available = history_size - continuation_start;
-            const int order_max_draft =
+            int order_max_draft =
                 order >= trusted_order_min ? std::max(max_draft, trusted_max_draft) : max_draft;
+            if (order == 2) {
+                order_max_draft = std::min(order_max_draft, 4);
+            }
             const int n_copy = std::min(order_max_draft, available);
             if (n_copy <= 0) {
                 continue;
