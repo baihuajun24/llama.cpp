@@ -82,6 +82,7 @@ struct ngplus_params {
     int batched_verify_max_k = 0;                  // Phase 5: cap verified batch length (0 = no cap)
     bool hot_table_chain_enabled = false;         // Phase 5: chained multi-token code-store drafts
     bool structure_indent_enabled = false;        // Phase 5: model-free indentation drafter
+    int prompt_local_pos_cap = 80;                // Phase 5: prompt-local echo source-pos cap (delta)
     bool hybrid_verify_enabled = false;           // Phase 5: blind for prompt echoes, correct for novel
     int static_hot_table_candidate_min_count = 2;
     int static_hot_table_candidate_min_top_share_pct = 50;
@@ -385,6 +386,9 @@ static void normalize_phase4_source_args(ngplus_params & ngp) {
     }
     if (has_csv_token(ngp.hot_source, "structure-indent")) {
         ngp.structure_indent_enabled = true;
+    }
+    if (has_csv_token(ngp.hot_source, "pl-fullspan")) {
+        ngp.prompt_local_pos_cap = 1 << 30; // allow verbatim prompt echoes from anywhere in the prompt
     }
     if (has_csv_token(ngp.hot_source, "hybrid-verify")) {
         ngp.hybrid_verify_enabled = true;
@@ -1235,7 +1239,8 @@ static prompt_draft_result prompt_local_draft(
         int max_draft,
         int trusted_order_min,
         int trusted_max_draft,
-        int prompt_tokens) {
+        int prompt_tokens,
+        int prompt_pos_cap) {
     prompt_draft_result result;
     if (max_draft <= 0 || history.size() < 2) {
         return result;
@@ -1265,7 +1270,7 @@ static prompt_draft_result prompt_local_draft(
             if (order < 4) {
                 continue;
             }
-            if (order >= 4 && pos > 80) {
+            if (order >= 4 && pos > prompt_pos_cap) {
                 continue;
             }
             if (order == 2 && pos > 11) {
@@ -2070,7 +2075,8 @@ int main(int argc, char ** argv) {
 
         const int64_t t_draft_start_us = ggml_time_us();
         prompt_draft_result draft_result = prompt_local_draft(
-            history, ngp.effective_ngram_max, draft_limit, 4, trusted_draft_limit, ngp.prompt_tokens);
+            history, ngp.effective_ngram_max, draft_limit, 4, trusted_draft_limit, ngp.prompt_tokens,
+            ngp.prompt_local_pos_cap);
         const int64_t draft_us = ggml_time_us() - t_draft_start_us;
 
         hot_table_lookup_result hot_table_lookup;
