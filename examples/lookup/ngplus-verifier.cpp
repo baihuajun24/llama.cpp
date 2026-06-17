@@ -80,6 +80,8 @@ struct ngplus_params {
     int recent_generation_min_order = 4;          // Phase 5: min suffix order for self-ref drafts
     bool batched_verify_enabled = false;          // Phase 5: correct batched spec verify (vs blind)
     int batched_verify_max_k = 0;                  // Phase 5: cap verified batch length (0 = no cap)
+    int batched_verify_min_order = 0;              // Phase 5: only batch drafts of >= this match order
+    int batched_verify_min_len = 0;                // Phase 5: only batch drafts of >= this length
     bool hot_table_chain_enabled = false;         // Phase 5: chained multi-token code-store drafts
     bool structure_indent_enabled = false;        // Phase 5: model-free indentation drafter
     int prompt_local_pos_cap = 80;                // Phase 5: prompt-local echo source-pos cap (delta)
@@ -392,6 +394,11 @@ static void normalize_phase4_source_args(ngplus_params & ngp) {
     }
     if (has_csv_token(ngp.hot_source, "selfref-o3")) {
         ngp.recent_generation_min_order = 3; // lower self-ref match order to raise coverage
+    }
+    if (has_csv_token(ngp.hot_source, "bv-confident")) {
+        // only correct-batch-verify long, high-order drafts (predicted accept-length high)
+        ngp.batched_verify_min_order = 6;
+        ngp.batched_verify_min_len = 4;
     }
     if (has_csv_token(ngp.hot_source, "hybrid-verify")) {
         ngp.hybrid_verify_enabled = true;
@@ -2189,6 +2196,8 @@ int main(int argc, char ** argv) {
         const bool use_batched_verify =
             (ngp.batched_verify_enabled || ngp.hybrid_verify_enabled) &&
             draft.size() > 1 &&
+            (int) draft.size() >= ngp.batched_verify_min_len &&
+            draft_result.order >= ngp.batched_verify_min_order &&
             !trace_step_diagnostics &&
             (ngp.hybrid_verify_enabled
                 // hybrid: blind-trust verbatim prompt echoes, correct-verify only novel sources
