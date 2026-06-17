@@ -390,6 +390,9 @@ static void normalize_phase4_source_args(ngplus_params & ngp) {
     if (has_csv_token(ngp.hot_source, "pl-fullspan")) {
         ngp.prompt_local_pos_cap = 1 << 30; // allow verbatim prompt echoes from anywhere in the prompt
     }
+    if (has_csv_token(ngp.hot_source, "selfref-o3")) {
+        ngp.recent_generation_min_order = 3; // lower self-ref match order to raise coverage
+    }
     if (has_csv_token(ngp.hot_source, "hybrid-verify")) {
         ngp.hybrid_verify_enabled = true;
     }
