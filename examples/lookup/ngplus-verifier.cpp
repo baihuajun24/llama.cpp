@@ -395,6 +395,9 @@ static void normalize_phase4_source_args(ngplus_params & ngp) {
     if (has_csv_token(ngp.hot_source, "selfref-o3")) {
         ngp.recent_generation_min_order = 3; // lower self-ref match order to raise coverage
     }
+    if (has_csv_token(ngp.hot_source, "selfref-o2")) {
+        ngp.recent_generation_min_order = 2; // extreme: shortest self-ref match (max coverage probe)
+    }
     if (has_csv_token(ngp.hot_source, "bv-confident")) {
         // only correct-batch-verify long, high-order drafts (predicted accept-length high)
         ngp.batched_verify_min_order = 6;
