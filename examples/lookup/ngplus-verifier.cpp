@@ -24,12 +24,18 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <cstring>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 struct ngplus_params {
     std::string hot_source = "prompt,hot-table";
     std::string hot_table_path;
     std::string cold_path;
     std::string cold_mmap = "on";
+    bool cold_mmap_active = false;   // Phase 6: true when the cold .coldidx mmap tier is in use
     std::string trace_path;
     std::string out_file;
     std::string reference_token_ids_arg;
@@ -140,6 +146,23 @@ struct static_hot_table {
     int order = 0;
     int64_t bytes = 0;
     std::unordered_map<std::string, hot_table_entry> entries;
+};
+
+// Phase 6: cold mmap tier. Instead of parsing the whole JSONL store into a DRAM hash map, mmap the
+// sorted fixed-record .coldidx sidecar and binary-search it per lookup, so the store stays on disk
+// (page cache) and DRAM use stays small. Record layout (little-endian), built by
+// build_phase4_magpie_store.py:write_cold_index_from_jsonl:
+//   header(64) = magic[8]="NGP4CID1", order u32, reserved u32, record_count u64, source_bytes u64, sha[32]
+//   record(order*4 + 24) = context[order]u32, line_offset u64, line_length u32, total_count u32,
+//                          top_token u32, top_count u32   (records sorted by context, ascending)
+struct cold_mmap_index {
+    int fd = -1;
+    const uint8_t * base = nullptr;
+    size_t file_size = 0;
+    int order = 0;
+    uint64_t record_count = 0;
+    size_t stride = 0;
+    bool ok = false;
 };
 
 static std::string token_key(const llama_tokens & tokens) {
@@ -1548,6 +1571,103 @@ static hot_table_lookup_result static_hot_table_lookup(
     return result;
 }
 
+static cold_mmap_index load_cold_mmap_index(const std::string & path) {
+    cold_mmap_index ix;
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        return ix;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < 64) {
+        close(fd);
+        return ix;
+    }
+    void * p = mmap(nullptr, (size_t) st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (p == MAP_FAILED) {
+        close(fd);
+        return ix;
+    }
+    const uint8_t * b = (const uint8_t *) p;
+    if (std::memcmp(b, "NGP4CID1", 8) != 0) {
+        munmap(p, (size_t) st.st_size);
+        close(fd);
+        return ix;
+    }
+    uint32_t order = 0;
+    uint64_t cnt = 0;
+    std::memcpy(&order, b + 8, 4);          // order u32 @8
+    std::memcpy(&cnt, b + 16, 8);           // record_count u64 @16
+    ix.fd = fd;
+    ix.base = b;
+    ix.file_size = (size_t) st.st_size;
+    ix.order = (int) order;
+    ix.record_count = cnt;
+    ix.stride = (size_t) order * 4 + 24;    // context(order*4) + Q,I,I,I,I (24)
+    ix.ok = ix.order > 0 && 64 + ix.record_count * ix.stride <= ix.file_size;
+    if (!ix.ok) {
+        munmap(p, (size_t) st.st_size);
+        close(fd);
+        ix.base = nullptr;
+        ix.fd = -1;
+    }
+    return ix;
+}
+
+// Binary search the mmap'd sorted records by integer-lexicographic context (matches the Python
+// tuple sort used at build time). Reads only top_token/top_count/total_count, which is all the
+// candidate-draft path needs.
+static hot_table_lookup_result cold_mmap_lookup(
+        const cold_mmap_index & ix,
+        const std::vector<llama_token> & history) {
+    hot_table_lookup_result result;
+    result.order = ix.order;
+    if (!ix.ok || ix.order <= 0 || (int) history.size() < ix.order) {
+        return result;
+    }
+    const llama_token * q = history.data() + (history.size() - ix.order);
+    const uint8_t * hdr = ix.base + 64;
+    auto cmp = [&](uint64_t i) -> int {
+        const uint8_t * c = hdr + i * ix.stride;
+        for (int k = 0; k < ix.order; ++k) {
+            uint32_t tv = 0;
+            std::memcpy(&tv, c + (size_t) k * 4, 4);
+            const int64_t rv = (int64_t) tv;
+            const int64_t qv = (int64_t) q[k];
+            if (rv < qv) return -1;
+            if (rv > qv) return 1;
+        }
+        return 0;
+    };
+    uint64_t lo = 0, hi = ix.record_count;
+    while (lo < hi) {
+        const uint64_t mid = lo + (hi - lo) / 2;
+        if (cmp(mid) < 0) lo = mid + 1; else hi = mid;
+    }
+    if (lo >= ix.record_count || cmp(lo) != 0) {
+        return result;
+    }
+    const uint8_t * rec = hdr + lo * ix.stride + (size_t) ix.order * 4;
+    uint32_t total_count = 0, top_token = 0, top_count = 0;
+    std::memcpy(&total_count, rec + 12, 4);  // after line_offset(8)@0, line_length(4)@8
+    std::memcpy(&top_token, rec + 16, 4);
+    std::memcpy(&top_count, rec + 20, 4);
+    result.hit = true;
+    result.total_count = (int) total_count;
+    result.rank = (int) lo;
+    result.candidate_count = 1;
+    result.top_token = (llama_token) top_token;
+    result.top_count = (int) top_count;
+    return result;
+}
+
+// Dispatch: cold mmap tier if active, else the DRAM hash table.
+static hot_table_lookup_result hot_lookup(
+        const static_hot_table & table,
+        const cold_mmap_index & ix,
+        const std::vector<llama_token> & history) {
+    return ix.ok ? cold_mmap_lookup(ix, history) : static_hot_table_lookup(table, history);
+}
+
 static bool static_hot_table_candidate_allowed(
         const hot_table_lookup_result & lookup,
         const ngplus_params & ngp) {
@@ -1586,15 +1706,17 @@ static prompt_draft_result static_hot_table_draft(
 // verify when enabled); never blind-trusted.
 static prompt_draft_result static_hot_table_chain_draft(
         const static_hot_table & table,
+        const cold_mmap_index & cold_ix,
         const ngplus_params & ngp,
         std::vector<llama_token> history,
         int draft_limit) {
     prompt_draft_result result;
-    if (draft_limit <= 0 || table.order <= 0) {
+    const int order = cold_ix.ok ? cold_ix.order : table.order;
+    if (draft_limit <= 0 || order <= 0) {
         return result;
     }
     for (int n = 0; n < draft_limit; ++n) {
-        hot_table_lookup_result lk = static_hot_table_lookup(table, history);
+        hot_table_lookup_result lk = hot_lookup(table, cold_ix, history);
         if (!static_hot_table_candidate_allowed(lk, ngp)) {
             break;
         }
@@ -1602,7 +1724,7 @@ static prompt_draft_result static_hot_table_chain_draft(
         history.push_back(lk.top_token);
     }
     if (!result.tokens.empty()) {
-        result.order = table.order;
+        result.order = order;
         result.source_pos = -1;
         result.continuation_start = -1;
         result.continuation_available = (int) result.tokens.size();
@@ -1677,7 +1799,7 @@ static void trace_step(
           << "\"step\":" << step << ","
           << "\"source\":\"" << json_escape(draft_source) << "\","
           << "\"hot_source\":\"" << json_escape(ngp.hot_source) << "\","
-          << "\"cold_source\":\"noop\","
+          << "\"cold_source\":\"" << (ngp.cold_mmap_active ? "mmap" : "noop") << "\","
           << "\"cold_path\":\"" << json_escape(ngp.cold_path) << "\","
           << "\"cold_mmap\":\"" << json_escape(ngp.cold_mmap) << "\","
           << "\"prompt_format\":\"" << (ngp.chat_template_applied ? "chat-single-turn" : "raw") << "\","
@@ -1970,9 +2092,28 @@ int main(int argc, char ** argv) {
     }
 
     static_hot_table hot_table;
+    cold_mmap_index cold_ix;
     const int64_t t_hot_init_start_us = ggml_time_us();
     try {
-        if (!ngp.hot_table_path.empty()) {
+        // Phase 6 cold tier: if the cold-path is a .coldidx sidecar and cold-mmap is on, mmap it and
+        // binary-search per lookup (store stays on disk; DRAM stays small) instead of the hash map.
+        if (ngp.hot_table_path.empty() && !ngp.cold_path.empty() &&
+                ends_with(ngp.cold_path, ".coldidx") && ngp.cold_mmap != "off") {
+            cold_ix = load_cold_mmap_index(ngp.cold_path);
+            if (cold_ix.ok) {
+                ngp.static_hot_table_loaded = true;
+                ngp.cold_mmap_active = true;
+                ngp.static_hot_table_order = cold_ix.order;
+                ngp.static_hot_table_rows = (int) cold_ix.record_count;
+                ngp.static_hot_table_bytes = (int64_t) cold_ix.file_size;
+                LOG_INF(
+                    "ngplus: mmap cold index records=%llu order=%d bytes=%llu from %s (DRAM hash skipped)\n",
+                    (unsigned long long) cold_ix.record_count, cold_ix.order,
+                    (unsigned long long) cold_ix.file_size, ngp.cold_path.c_str());
+            } else {
+                LOG_ERR("ngplus: failed to mmap cold index %s\n", ngp.cold_path.c_str());
+            }
+        } else if (!ngp.hot_table_path.empty()) {
             hot_table = load_static_hot_table(ngp.hot_table_path);
             ngp.static_hot_table_loaded = !hot_table.entries.empty();
             ngp.static_hot_table_order = hot_table.order;
@@ -2095,7 +2236,7 @@ int main(int argc, char ** argv) {
         hot_table_lookup_result hot_table_lookup;
         const int64_t t_static_hot_lookup_start_us = ggml_time_us();
         if (ngp.static_hot_table_loaded) {
-            hot_table_lookup = static_hot_table_lookup(hot_table, history);
+            hot_table_lookup = hot_lookup(hot_table, cold_ix, history);
             if (hot_table_lookup.hit) {
                 ++ngp.static_hot_table_hits;
             } else {
@@ -2107,7 +2248,7 @@ int main(int argc, char ** argv) {
 
         if (draft_result.tokens.empty() && static_hot_table_candidate_allowed(hot_table_lookup, ngp)) {
             draft_result = ngp.hot_table_chain_enabled
-                ? static_hot_table_chain_draft(hot_table, ngp, history, draft_limit)
+                ? static_hot_table_chain_draft(hot_table, cold_ix, ngp, history, draft_limit)
                 : static_hot_table_draft(hot_table_lookup, ngp, draft_limit);
         }
 
